@@ -1,0 +1,28 @@
+MONGODB_URL="mongodb+srv://ken:123456q@cluster0.wqpkz.mongodb.net/shadowmax?retryWrites=true&w=majority"
+CRYPTOJS_CIPHER="1250@ShadowMax"
+PORT=5005
+JWT_SECRET="shadowmaxcantguess"
+NODE_ENV=production
+
+EMAIL_PASS="jiqu eomw fldu bbed"
+EMAIL_USER="shadowmax1200@gmail.com"
+
+RESET_PASSWORD_AFTER_SUCCESS="CRYPTOJS_CIPHER"
+IPINFO_API_KEY="e1ba6d6622c806"
+
+BASE_URL = 'https://api.nodemaven.com/api/v2/base'
+NODEMAVEN_API_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbl90eXBlIjoiYWNjZXNzIiwiZXhwIjoxNzQwNzE4MTQ2LCJpYXQiOjE3NDA3MTYzNDYsImp0aSI6ImM3NzQzMDkwN2Q4ZjQ3YjBhNDRkODkzMDBjOWRiMjA0IiwidXNlcl9pZCI6IjIyZTBiZGUwLWVlNGItNDI2MS1hMWI4LTUzMWVhMmFmZTU1NSJ9.gbYbR0PLBurKEKSUjN7bKWUEN7GM6hyltXu3ibF7gtA"
+
+WEB_HOOK_URL = "https://shadowmax-backend.vercel.app/api/v1/payments/webhook",
+PAY_STACK_URL="https://api.paystack.co"
+PAY_STACK_SECRET_KEY="sk_live_59ba12e95724ad838d7875bf51d9b4e4a4616ea4"
+
+K2_BASE_URL="https://api.kopokopo.com/"
+KOPO_KOPO_TILL_NUMBER="K518764"
+K2_CLIENT_SECRET="lbavdlUJbDqkxqI1E-0vHJgK92oaJRru6ibjnu2VTFk"
+K2_CLIENT_ID="mdx3xvPOLx9AJbaWwXXa-Rr0S4n7w_2TKa5MAsqvWaI"
+K2_API_KEY="e06c3b438f1acd65a89d13f491bc0dfca64ae5bf"
+
+COINPAL_MERCHANT_ID=100007249
+COIN_PAL_URL ="https://pay.coinpal.io/gateway"
+COIN_PAL_SECRET_KEY=a884cc24958d2969f7f41f5c0f28c5fd3d6d3e764ca69c4b00aeb5aedc2927d5 
