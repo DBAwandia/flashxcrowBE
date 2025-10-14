@@ -1,6 +1,6 @@
-export const formatProxyUsername = (email: string) => {
-    const [username, domain] = email?.split("@"); // Split email into username & domain
-    const domainName = domain.split(".")[0]; // Get the first part of the domain
-    return ("max_" + domainName + "_" + username)
-      .replace(/[\._]/g, "") // Remove dots and underscores
-  };
+export const formatProxyUsername = (username: string) => {
+  // Remove any special characters and format with flushX
+  return ("flushX_" + username)
+    .replace(/[^a-zA-Z0-9_]/g, "") // Remove all non-alphanumeric characters except underscore
+    .toLowerCase(); // Convert to lowercase for consistency
+};

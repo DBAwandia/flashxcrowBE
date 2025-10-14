@@ -28,6 +28,7 @@ export interface IUser extends Document {
   lastAmountGB?: number;
   lastTransactionDate?: Date;
   paymentCount?: number;
+  username?: string; // 🧠 New field added here
 
   // 🧩 Claim codes directly attached to user
   claimCodes?: IClaimCode[];
@@ -42,18 +43,20 @@ const ClaimCodeSchema = new Schema<IClaimCode>(
     usageCount: { type: Number, default: 0 },
     maxUsage: { type: Number, default: 1 },
   },
-  { _id: false } // avoid separate _id for each embedded code
+  { _id: false }
 );
 
 const UserSchema: Schema = new Schema(
   {
     email: { type: String, required: true, unique: true },
+    username: { type: String, trim: true, required: true, unique: true }, // 🧠 Added username field here
+
     password: { type: String, required: true, select: false },
     isAdmin: { type: Boolean, required: true },
     isDisabled: { type: Boolean, required: true },
     balance: { type: Number, required: true, default: 0 },
 
-    // 💰 Wallet-related fields (Escrow / Proxy)
+    // 💰 Wallet-related fields
     walletBalance: { type: Number, default: 0 },
     walletFrozeBalance: { type: Number, default: 0 },
     hasDispute: { type: Boolean, default: false },

@@ -144,10 +144,11 @@ export const createUser = async (req: Request, res: Response) => {
       resetOtp,
       otpExpiry,
       country,
+      username,
       city,
     } = req.body;
 
-    if (!email || !password) {
+    if (!email || !password || !username) {
       console.warn("❌ Missing required fields:", {
         emailProvided: !!email,
         passwordProvided: !!password,
@@ -156,10 +157,16 @@ export const createUser = async (req: Request, res: Response) => {
       return;
     }
 
-    // Check if user already exists
-    const isUserAlreadyRegistered = await User.findOne({ email: email });
-    if (isUserAlreadyRegistered) {
-      res.status(409).json({ message: "User already exists" });
+    // Check if user already exists (by email or username)
+    const existingUser = await User.findOne({
+      $or: [{ email: email }, { username: username }],
+    });
+
+    if (existingUser) {
+      let conflictField = existingUser.email === email ? "email" : "username";
+      res.status(409).json({
+        message: `User with this ${conflictField} already exists`,
+      });
       return;
     }
 
@@ -176,7 +183,7 @@ export const createUser = async (req: Request, res: Response) => {
     }
 
     // Generate proxy credentials
-    const proxy_username = formatProxyUsername(email);
+    const proxy_username = formatProxyUsername(username);
     const proxy_password = generatePassword(12);
 
     const subUserData = {
@@ -214,6 +221,7 @@ export const createUser = async (req: Request, res: Response) => {
       subUserId,
       country,
       city,
+      username,
     });
 
     try {
@@ -223,7 +231,7 @@ export const createUser = async (req: Request, res: Response) => {
       return;
     }
 
-    res.status(201).json({ message: "User created successfully" });
+    res.status(201).json({ message: "Your account has been created." });
   } catch (error) {
     handleServerError(res, error, "Server Error, Please try again");
   }
@@ -232,66 +240,77 @@ export const createUser = async (req: Request, res: Response) => {
 // Login user
 export const loginUser = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { login, password } = req.body; // Changed from 'email' to 'login'
 
-    if (!email || !password) {
-      res.status(400).json({ message: "Email and password required" });
+    // Validate input
+    if (!login || !password) {
+      res
+        .status(400)
+        .json({ message: "Username/email and password are required" });
       return;
     }
 
-    const userDoc = await User.findOne({ email: email })
+    // Determine if login is email or username
+    const isEmail = login.includes("@");
+    const queryCondition = isEmail
+      ? { email: login.toLowerCase().trim() }
+      : { username: login.trim() };
+
+    // Find user with case-insensitive search for email
+    const userDoc = await User.findOne(queryCondition)
       .select("+password")
       .lean();
 
     if (!userDoc) {
-      res
-        .status(401)
-        .json({ message: "Unauthorized. Please register to continue." });
+      res.status(401).json({ message: "Invalid credentials" }); // Generic message for security
+      return;
     }
 
-    if (userDoc?.isDisabled) {
+    // Check if account is disabled
+    if (userDoc.isDisabled) {
       res
         .status(403)
         .json({ message: "Account suspended. Please contact support." });
       return;
     }
 
-    if (!userDoc?.password) {
+    // Validate password exists
+    if (!userDoc.password) {
       res
         .status(500)
-        .json({ message: "User record is corrupted. No password found." });
+        .json({ message: "User record is corrupted. Please contact support." });
       return;
     }
 
-    // Decrypt stored password
+    // Decrypt and verify password
     const hashedPassword = CryptoJS.AES.decrypt(
-      userDoc?.password || "",
+      userDoc.password,
       process.env.CRYPTOJS_CIPHER as string
     );
     const originalPassword = hashedPassword.toString(CryptoJS.enc.Utf8);
 
+    // Use timing-safe comparison (consider using bcrypt for future implementations)
     if (originalPassword !== password) {
-      res.status(403).json({ message: "Wrong credentials" });
+      res.status(401).json({ message: "Invalid credentials" });
       return;
     }
 
-    if (!userDoc?.password) {
-      res
-        .status(500)
-        .json({ message: "User record is corrupted. No password found." });
-      return;
-    }
     // Generate JWT Token
     const token = jwt.sign(
-      { id: userDoc?._id, email: userDoc?.email, isAdmin: userDoc.isAdmin }, // Payload
-      process.env.JWT_SECRET as string, // Secret key
-      { expiresIn: "7d" } // Token expiry
+      {
+        id: userDoc._id,
+        email: userDoc.email,
+        username: userDoc.username,
+        isAdmin: userDoc.isAdmin,
+      },
+      process.env.JWT_SECRET as string,
+      { expiresIn: "7d" }
     );
 
     // Set cookie with JWT
     res.cookie("authToken", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production", // Only secure in production
+      secure: process.env.NODE_ENV === "production",
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
       sameSite: "none",
       domain:
@@ -303,9 +322,17 @@ export const loginUser = async (req: Request, res: Response) => {
     // Remove sensitive fields before sending response
     const { password: _, otpExpiry, resetOtp, ...safeUserData } = userDoc;
 
-    res.json({ message: "Login successful", user: safeUserData, token });
+    res.status(200).json({
+      message: "You’re now signed in.",
+      user: safeUserData,
+      token,
+    });
   } catch (error) {
-    handleServerError(res, error, "Server Error, Please try again");
+    handleServerError(
+      res,
+      error,
+      "Server error during login. Please try again."
+    );
   }
 };
 

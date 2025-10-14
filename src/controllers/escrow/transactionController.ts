@@ -10,6 +10,7 @@ import {
   logEscrowFunding,
   logEscrowRefund,
   logEscrowReleaseToSeller,
+  logSellerFeeDeduction,
 } from "../../utils/escrow-transfers/escrowTansfers";
 import { convertToUSD, exchangeRate } from "../../utils/conversion";
 
@@ -51,7 +52,7 @@ export const createEscrowTransaction = async (
       amount,
       fee,
       role, // "buyer" | "seller" | "broker"
-      payerRole, // only required when role = "seller" or "broker"
+      payerRole, // "buyer" | "seller" | "split" (50/50)
       currency,
       couponCode,
       claimCode,
@@ -73,9 +74,19 @@ export const createEscrowTransaction = async (
       return;
     }
 
+    // ✅ Validate payerRole for seller/broker creators
+    if (role === "seller" || role === "broker") {
+      if (!payerRole || !["buyer", "seller", "split"].includes(payerRole)) {
+        res.status(400).json({
+          message:
+            "payerRole is required when creator is seller or broker (must be 'buyer', 'seller', or 'split').",
+        });
+        return;
+      }
+    }
+
     // ✅ Validate claim code if provided
     if (claimCode) {
-      // Check if the claim code exists in ANY user
       const existingClaimCode = await User.findOne({
         "claimCodes.code": claimCode,
       });
@@ -85,7 +96,6 @@ export const createEscrowTransaction = async (
         return;
       }
 
-      // Extract the exact claim object from that user
       const claim = existingClaimCode.claimCodes?.find(
         (c: any) => c.code === claimCode
       );
@@ -95,19 +105,16 @@ export const createEscrowTransaction = async (
         return;
       }
 
-      // Check if it's expired
       if (new Date(claim.expiresAt) < new Date()) {
         res.status(400).json({ message: "Claim code has expired" });
         return;
       }
 
-      // Optionally check if inactive
       if (!claim.isActive) {
         res.status(400).json({ message: "Claim code is inactive" });
         return;
       }
 
-      // Optionally check if usage limit reached
       if (claim.usageCount >= (claim.maxUsage || 1)) {
         res.status(400).json({ message: "Claim code usage limit reached" });
         return;
@@ -128,7 +135,7 @@ export const createEscrowTransaction = async (
       return;
     }
 
-    // ✅ Ensure wallet fields exist for all participants before continuing
+    // ✅ Ensure wallet fields exist for all participants
     const buyer = await ensureFields(buyerRaw, session);
     const seller = await ensureFields(sellerRaw, session);
     const broker = brokerRaw ? await ensureFields(brokerRaw, session) : null;
@@ -148,6 +155,9 @@ export const createEscrowTransaction = async (
 
     let payerEmail: string | null = null;
     let isPaid = false;
+    let buyerFeeInUSD = 0;
+    let sellerFeeInUSD = 0;
+
     // 🔹 Hardcoded coupons array
     const HARDCODED_COUPONS = [
       { code: "XWADDA", discountPercent: 50 },
@@ -187,6 +197,13 @@ export const createEscrowTransaction = async (
         ? feeInUSD * ((100 - discountPercentToApply) / 100)
         : feeInUSD;
 
+    // 💰 Handle fee splitting logic
+    if (payerRole === "split") {
+      // Split fee 50/50 between buyer and seller
+      buyerFeeInUSD = discountedFeeInUSD / 2;
+      sellerFeeInUSD = discountedFeeInUSD / 2;
+    }
+
     // 💰 Case 1: Buyer creates escrow → auto-deduct & mark as paid
     if (role === "buyer") {
       const totalAmountInUSD = amountInUSD + discountedFeeInUSD;
@@ -198,9 +215,8 @@ export const createEscrowTransaction = async (
         });
         return;
       }
-      console.log(buyer);
 
-      // Deduct & freeze buyer funds (will now always work because ensureFields created the field)
+      // Deduct & freeze buyer funds
       const updatedBuyer = await User.findOneAndUpdate(
         { email: buyer?.email, walletBalance: { $gte: totalAmountInUSD } },
         {
@@ -211,7 +227,6 @@ export const createEscrowTransaction = async (
         },
         { new: true, session }
       );
-      console.log(updatedBuyer);
 
       if (!updatedBuyer) {
         await session.abortTransaction();
@@ -228,18 +243,58 @@ export const createEscrowTransaction = async (
 
     // 💰 Case 2: Seller or Broker creates escrow → determine who pays
     else if (role === "seller" || role === "broker") {
-      if (!payerRole || !["buyer", "seller"].includes(payerRole)) {
-        res.status(400).json({
-          message:
-            "payerRole is required when creator is seller or broker (must be 'buyer' or 'seller').",
-        });
-        return;
+      if (payerRole === "split") {
+        // For split payment - track 50/50 fee allocation
+        buyerFeeInUSD = discountedFeeInUSD / 2;
+        sellerFeeInUSD = discountedFeeInUSD / 2;
+
+        const buyerTotal = amountInUSD + buyerFeeInUSD;
+        const buyerBalance = Number(buyer.walletBalance || 0);
+
+        if (buyerBalance < buyerTotal) {
+          res.status(400).json({
+            message: "Insufficient wallet balance for split fee payment.",
+          });
+          return;
+        }
+
+        // Deduct from buyer only
+        const updatedBuyer = await User.findOneAndUpdate(
+          { email: buyerEmail, walletBalance: { $gte: buyerTotal } },
+          {
+            $inc: {
+              walletBalance: -buyerTotal,
+              walletFrozeBalance: buyerTotal,
+            },
+          },
+          { new: true, session }
+        );
+
+        if (!updatedBuyer) {
+          await session.abortTransaction();
+          res.status(400).json({
+            message: "Failed to deduct split fees — insufficient balance.",
+          });
+          return;
+        }
+
+        isPaid = true;
+      } else {
+        // Single payer (buyer or seller)
+        payerEmail = payerRole === "buyer" ? buyerEmail : sellerEmail;
+
+        // Set fee allocation based on payer role
+        if (payerRole === "buyer") {
+          buyerFeeInUSD = discountedFeeInUSD;
+          sellerFeeInUSD = 0;
+        } else {
+          buyerFeeInUSD = 0;
+          sellerFeeInUSD = discountedFeeInUSD;
+        }
+
+        isPaid = false;
       }
-      payerEmail = payerRole === "buyer" ? buyerEmail : sellerEmail;
-      isPaid = false;
     }
-    console.log(req.user);
-    console.log(req.user?.email);
 
     // 🧾 Create escrow transaction
     const [transaction] = await EscrowTransaction.create(
@@ -249,13 +304,20 @@ export const createEscrowTransaction = async (
           sellerEmail,
           brokerEmail: brokerEmail || null,
           brokerAmount: brokerAmount ? Number(brokerAmount) : 0,
-          payerRole: payerEmail === buyerEmail ? "buyer" : "seller",
+          payerRole:
+            payerRole === "split"
+              ? "split"
+              : payerEmail === buyerEmail
+              ? "buyer"
+              : "seller",
           item,
           description,
-          amount: Number(amount), // Store original amount
-          amountInUSD: amountInUSD, // Store converted amount for internal calculations
-          fee: Number(fee), // Store original fee
-          feeInUSD: discountedFeeInUSD, // Store converted and discounted fee
+          amount: Number(amount),
+          amountInUSD: amountInUSD,
+          fee: Number(fee),
+          feeInUSD: discountedFeeInUSD,
+          buyerFeeInUSD, // Store buyer's portion for split
+          sellerFeeInUSD, // Store seller's portion for split
           currency,
           couponCode,
           claimCode,
@@ -263,13 +325,13 @@ export const createEscrowTransaction = async (
             appliedCoupon && appliedCoupon?.discountPercent
               ? Number(appliedCoupon?.discountPercent)
               : 0,
-          exchangeRate: currency.toUpperCase() === "KES" ? exchangeRate : null, // Store rate used for conversion
+          exchangeRate: currency.toUpperCase() === "KES" ? exchangeRate : null,
           isPaid,
           status: "new",
           joinedBy: [
             {
-              email: req.user?.email || "", // the creator's email
-              role, // "buyer" | "seller" | "broker"
+              email: req.user?.email || "",
+              role,
               joinedAt: new Date(),
             },
           ],
@@ -281,11 +343,27 @@ export const createEscrowTransaction = async (
     await session.commitTransaction();
     session.endSession();
 
+    // Custom success message based on payment type
+    let successMessage = "";
+    if (isPaid) {
+      if (payerRole === "split") {
+        successMessage =
+          "Escrow created with 50/50 fee split. Payment processed from both parties.";
+      } else {
+        successMessage = "Escrow created and payment successfully processed.";
+      }
+    } else {
+      if (payerRole === "split") {
+        successMessage =
+          "Escrow created with 50/50 fee split. Awaiting payment from both parties.";
+      } else {
+        successMessage = `Escrow created successfully. Awaiting payment from ${payerEmail}.`;
+      }
+    }
+
     res.status(201).json({
       success: true,
-      message: isPaid
-        ? "Escrow created and payment successfully processed."
-        : `Escrow created successfully. Awaiting payment from ${payerEmail}.`,
+      message: successMessage,
       transaction,
     });
   } catch (error) {
@@ -359,7 +437,7 @@ export const getEscrowTransactions = async (
     const transactions = await EscrowTransaction.find(filter)
       .skip((pageNumber - 1) * limitNumber)
       .limit(limitNumber)
-      .sort({ _id: -1 });
+      .sort({ updatedAt: -1, createdAt: -1 });
 
     const totalTransactions = await EscrowTransaction.countDocuments(filter);
 
@@ -467,7 +545,7 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       return;
     }
 
-    if (["approved", "cancelled"].includes(transaction.status)) {
+    if (["approved"].includes(transaction.status)) {
       await session.abortTransaction();
       res
         .status(400)
@@ -485,7 +563,67 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       transaction._id as mongoose.Types.ObjectId
     ).toString();
 
+    // 🆕 Calculate total amounts based on fee payer type
+    const getTotalAmounts = () => {
+      const amountInUSD = transaction.amountInUSD || transaction.amount;
+      const feeInUSD = transaction.feeInUSD || transaction.fee;
+
+      if (transaction.payerRole === "split") {
+        // For split payments, buyer pays amount + half fee
+        const buyerTotal =
+          amountInUSD + (transaction.buyerFeeInUSD || feeInUSD);
+        const sellerTotal = transaction.sellerFeeInUSD || feeInUSD;
+        return { buyerTotal, sellerTotal, totalAmount: amountInUSD + feeInUSD };
+      } else {
+        // For single payer
+        const totalAmount = amountInUSD + feeInUSD;
+        return {
+          buyerTotal: totalAmount,
+          sellerTotal: 0,
+          totalAmount,
+        };
+      }
+    };
+
     switch (status) {
+      case "reopen": {
+        // Only admin or participants (buyer) can reopen
+        if (!isAdmin && requestingEmail !== buyer.email) {
+          await session.abortTransaction();
+          res.status(403).json({
+            message:
+              "Only admin or transaction participants can reopen this transaction",
+          });
+          return;
+        }
+
+        if (transaction.status !== "cancelled") {
+          await session.abortTransaction();
+          res.status(400).json({
+            message: "Only cancelled transactions can be reopened",
+          });
+          return;
+        }
+
+        // Restore the transaction to "new" without wiping original data
+        transaction.status = "new";
+        transaction.isPaid = false;
+        transaction.joinedBy = []; // participants will rejoin
+        transaction.hasDispute = false;
+        transaction.disputeReason = undefined;
+        transaction.disputedBy = undefined;
+
+        await transaction.save({ session });
+        await session.commitTransaction();
+
+        res.status(200).json({
+          success: true,
+          message: "Cancelled transaction has been reopened and is now 'new'.",
+          transaction,
+        });
+        return;
+      }
+
       case "join": {
         let role: "buyer" | "seller" | "broker" | null = null;
         if (requestingEmail === transaction.buyerEmail) role = "buyer";
@@ -512,43 +650,71 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        const totalAmount = transaction.amount + (transaction.fee || 0);
+        const { buyerTotal, sellerTotal, totalAmount } = getTotalAmounts();
 
         if (!transaction.isPaid) {
-          const payerRole = transaction.payerRole || "buyer";
-          const payer = payerRole === "buyer" ? buyer : seller;
+          // 🆕 Handle payment based on payer role
+          if (transaction.payerRole === "split") {
+            // For split payments, only buyer pays upfront
+            if (buyer.walletBalance < buyerTotal) {
+              await session.abortTransaction();
+              res.status(400).json({
+                message: "Insufficient buyer balance for split fee payment",
+              });
+              return;
+            }
 
-          if (!payer) {
-            await session.abortTransaction();
+            // Deduct only from buyer for split payments
+            buyer.walletBalance -= buyerTotal;
+            buyer.walletFrozeBalance += buyerTotal;
 
-            res
-              .status(400)
-              .json({ message: "Invalid payer role configuration" });
-            return;
+            await logEscrowFunding(
+              buyer.email,
+              transaction.amount,
+              transaction.buyerFeeInUSD || 0,
+              escrowTransactionId,
+              { ...participants, payer: "split-buyer" },
+              session
+            );
+
+            await buyer.save({ session });
+          } else {
+            // Single payer
+            const payerRole = transaction.payerRole || "buyer";
+            const payer = payerRole === "buyer" ? buyer : seller;
+
+            if (!payer) {
+              await session.abortTransaction();
+              res
+                .status(400)
+                .json({ message: "Invalid payer role configuration" });
+              return;
+            }
+
+            if (payer.walletBalance < totalAmount) {
+              await session.abortTransaction();
+              res.status(400).json({
+                message: `${payerRole} has insufficient balance to fund escrow.`,
+              });
+              return;
+            }
+
+            payer.walletBalance -= totalAmount;
+            payer.walletFrozeBalance += totalAmount;
+
+            await logEscrowFunding(
+              payer.email,
+              transaction.amount,
+              transaction.feeInUSD || transaction.fee,
+              escrowTransactionId,
+              participants,
+              session
+            );
+
+            await payer.save({ session });
           }
 
-          if (payer.walletBalance < totalAmount) {
-            await session.abortTransaction();
-            res.status(400).json({
-              message: `${payerRole} has insufficient balance to fund escrow.`,
-            });
-            return;
-          }
-
-          payer.walletBalance -= totalAmount;
-          payer.walletFrozeBalance += totalAmount;
           transaction.isPaid = true;
-
-          await logEscrowFunding(
-            payer.email,
-            transaction.amount,
-            transaction.fee || 0,
-            escrowTransactionId,
-            participants,
-            session
-          );
-
-          await payer.save({ session });
         }
 
         transaction.joinedBy.push({
@@ -575,54 +741,85 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       }
 
       case "cancelled": {
-        const payerRole = transaction.payerRole || "buyer";
-        const payer = payerRole === "buyer" ? buyer : seller;
-        const totalAmount = transaction.amount + (transaction.fee || 0);
+        // 🆕 Calculate amounts WITHOUT fees for cancellation
+        const getCancellationAmounts = () => {
+          const amountInUSD = transaction.amountInUSD || transaction.amount;
 
-        if (!isAdmin && requestingEmail !== seller.email) {
+          if (transaction.payerRole === "split") {
+            // For split payments, buyer only gets amount back (no fee refund)
+            const buyerRefund = amountInUSD;
+            return { buyerRefund, totalRefund: amountInUSD };
+          } else {
+            // For single payer, only refund the amount (no fees)
+            return {
+              buyerRefund: amountInUSD,
+              sellerRefund: 0,
+              totalRefund: amountInUSD,
+            };
+          }
+        };
+
+        const { buyerRefund, totalRefund } = getCancellationAmounts();
+
+        // 🆕 Allow buyer to cancel if not all parties have joined
+        const joinedRoles = transaction.joinedBy?.map((p) => p.role) || [];
+        const allPartiesJoined =
+          joinedRoles.includes("buyer") && joinedRoles.includes("seller");
+
+        if (
+          !isAdmin &&
+          requestingEmail !== seller.email &&
+          !(requestingEmail === buyer.email && !allPartiesJoined)
+        ) {
           await session.abortTransaction();
-          res
-            .status(403)
-            .json({ message: "Only seller or admin can cancel transaction." });
+          res.status(403).json({
+            message:
+              "Only seller, admin, or buyer (before all parties join) can cancel transaction.",
+          });
           return;
         }
 
-        const sellerOwes = transaction.brokerEmail
-          ? transaction.amount - (transaction.brokerAmount || 0)
-          : transaction.amount;
-        const brokerOwes = transaction.brokerAmount || 0;
-
+        // 🆕 Only check seller/broker funds if transaction was approved (funds were released)
         let sellerRefund = 0;
         let brokerRefund = 0;
 
-        if (seller.walletBalance >= sellerOwes) {
-          seller.walletBalance -= sellerOwes;
-          sellerRefund = sellerOwes;
-        } else if (seller.walletBalance < sellerOwes) {
-          sellerRefund = seller.walletBalance;
-          seller.walletBalance = 0;
-        }
+        if (transaction.status === "approved") {
+          // Transaction was approved, funds were released to seller - need to recover
+          const sellerOwes = transaction.brokerEmail
+            ? transaction.amount - (transaction.brokerAmount || 0)
+            : transaction.amount;
+          const brokerOwes = transaction.brokerAmount || 0;
 
-        let broker;
-        if (transaction.brokerEmail) {
-          broker = await User.findOne({
-            email: transaction.brokerEmail,
-          }).session(session);
-          if (broker) {
-            if (broker.walletBalance >= brokerOwes) {
-              broker.walletBalance -= brokerOwes;
-              brokerRefund = brokerOwes;
-            } else if (broker.walletBalance < brokerOwes) {
-              brokerRefund = broker.walletBalance;
-              broker.walletBalance = 0;
+          if (seller.walletBalance >= sellerOwes) {
+            seller.walletBalance -= sellerOwes;
+            sellerRefund = sellerOwes;
+          } else if (seller.walletBalance < sellerOwes) {
+            sellerRefund = seller.walletBalance;
+            seller.walletBalance = 0;
+          }
+
+          let broker;
+          if (transaction.brokerEmail) {
+            broker = await User.findOne({
+              email: transaction.brokerEmail,
+            }).session(session);
+            if (broker) {
+              if (broker.walletBalance >= brokerOwes) {
+                broker.walletBalance -= brokerOwes;
+                brokerRefund = brokerOwes;
+              } else if (broker.walletBalance < brokerOwes) {
+                brokerRefund = broker.walletBalance;
+                broker.walletBalance = 0;
+              }
+              await broker.save({ session });
             }
-            await broker.save({ session });
           }
         }
 
         const totalRefundRecovered = sellerRefund + brokerRefund;
 
-        if (totalRefundRecovered <= 0) {
+        // 🆕 Only check for insufficient funds if transaction was approved and funds need recovery
+        if (transaction.status === "approved" && totalRefundRecovered <= 0) {
           await session.abortTransaction();
           res.status(400).json({
             success: false,
@@ -632,36 +829,83 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        payer.walletBalance += totalRefundRecovered;
-        payer.walletFrozeBalance -= totalAmount;
+        // 🆕 Handle refund based on payer role - ONLY REFUND PRINCIPAL AMOUNT
+        if (transaction.payerRole === "split") {
+          // For split payments, refund only principal amount to buyer (no fees)
+          buyer.walletBalance += buyerRefund;
+          buyer.walletFrozeBalance -=
+            (transaction.amountInUSD || transaction.amount) +
+            (transaction.buyerFeeInUSD || 0);
 
-        await logEscrowRefund(
-          payer.email,
-          totalRefundRecovered,
-          escrowTransactionId,
-          participants,
-          session
-        );
+          await logEscrowRefund(
+            buyer.email,
+            buyerRefund,
+            escrowTransactionId,
+            {
+              ...participants,
+              payer: "split-buyer",
+              refundType: "principal_only",
+            },
+            session
+          );
+
+          await buyer.save({ session });
+        } else {
+          // Single payer refund - only refund principal amount
+          const payerRole = transaction.payerRole || "buyer";
+          const payer = payerRole === "buyer" ? buyer : seller;
+
+          const refundAmount =
+            transaction.status === "approved"
+              ? totalRefundRecovered
+              : totalRefund;
+
+          payer.walletBalance += refundAmount;
+          payer.walletFrozeBalance -=
+            (transaction.amountInUSD || transaction.amount) +
+            (transaction.feeInUSD || transaction.fee);
+
+          await logEscrowRefund(
+            payer.email,
+            refundAmount,
+            escrowTransactionId,
+            { ...participants, refundType: "principal_only" },
+            session
+          );
+
+          await payer.save({ session });
+        }
 
         transaction.status = "cancelled";
 
         await Promise.all([
-          payer.save({ session }),
           seller.save({ session }),
           transaction.save({ session }),
         ]);
 
         await session.commitTransaction();
 
-        const refundMsg =
-          totalRefundRecovered < transaction.amount
-            ? `Transaction cancelled — partial refund of $${totalRefundRecovered} recovered out of $${totalAmount}.`
-            : "Transaction cancelled and funds refunded successfully.";
+        // 🆕 Different messages based on whether funds were released
+        let refundMsg = "";
+        const status = transaction.status as
+          | "approved"
+          | "cancelled"
+          | "pending";
+
+        if (status === "approved") {
+          refundMsg =
+            totalRefundRecovered < transaction.amount
+              ? `Transaction cancelled — partial refund of $${totalRefundRecovered} recovered out of $${transaction.amount}.`
+              : "Transaction cancelled and funds refunded successfully.";
+        } else {
+          refundMsg =
+            "Transaction cancelled successfully. All frozen funds have been refunded.";
+        }
 
         res.status(200).json({
           success: true,
           message: refundMsg,
-          refunded: totalRefundRecovered,
+          refunded: status === "approved" ? totalRefundRecovered : totalRefund,
           transaction,
         });
         return;
@@ -674,10 +918,7 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        const payerRole = transaction.payerRole || "buyer";
-        const payer = payerRole === "buyer" ? buyer : seller;
-        const totalAmountBeforeFeeUpdate =
-          transaction.amount + (transaction.fee || 0);
+        const { buyerTotal, totalAmount } = getTotalAmounts();
 
         let sellerAmount = transaction.amount;
         if (transaction.brokerEmail && transaction.brokerAmount) {
@@ -701,8 +942,29 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           }
         }
 
+        // 🆕 Handle seller fee deduction for split payments on successful transaction
+        if (transaction.payerRole === "split") {
+          const sellerFee =
+            transaction.sellerFeeInUSD ||
+            (transaction.feeInUSD || transaction.fee) / 2;
+
+          if (seller.walletBalance >= sellerFee) {
+            // Deduct seller's fee portion
+            seller.walletBalance -= sellerFee;
+
+            await logSellerFeeDeduction(
+              seller.email,
+              sellerFee,
+              escrowTransactionId,
+              participants,
+              session
+            );
+          }
+          // If seller doesn't have enough balance, proceed without deducting (graceful handling)
+        }
+
         let claimResult = null;
-        let feeAfterClaim = transaction.fee;
+        let feeAfterClaim = transaction.feeInUSD || transaction.fee;
 
         if (transaction.claimCode) {
           const claimOwner = await User.findOne({
@@ -715,17 +977,18 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
             const claimResponse = await applyClaimCodeReward(
               claimOwner,
               transaction.claimCode,
-              transaction.fee,
+              transaction.feeInUSD || transaction.fee,
               session
             );
 
             if (claimResponse) {
               claimResult = claimResponse;
               feeAfterClaim = Math.max(
-                transaction.fee - claimResponse.reward,
+                (transaction.feeInUSD || transaction.fee) -
+                  claimResponse.reward,
                 0
               );
-              transaction.fee = feeAfterClaim;
+              transaction.feeInUSD = feeAfterClaim;
 
               await logClaimReward(
                 claimOwner.email,
@@ -752,7 +1015,18 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           session
         );
 
-        payer.walletFrozeBalance -= totalAmountBeforeFeeUpdate;
+        // 🆕 Handle frozen balance release based on payer role
+        if (transaction.payerRole === "split") {
+          // Only release buyer's frozen balance (seller didn't freeze any funds)
+          buyer.walletFrozeBalance -= buyerTotal;
+          await buyer.save({ session });
+        } else {
+          const payerRole = transaction.payerRole || "buyer";
+          const payer = payerRole === "buyer" ? buyer : seller;
+          payer.walletFrozeBalance -= totalAmount;
+          await payer.save({ session });
+        }
+
         transaction.status = "approved";
         transaction.claimApplied = claimResult || null;
 

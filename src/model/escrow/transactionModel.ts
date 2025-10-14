@@ -31,6 +31,13 @@ export interface IEscrowTransaction extends Document {
   claimApplied?: IClaimApplied | null;
   isClaimed?: boolean;
 
+  // 🆕 Split Fee Fields
+  amountInUSD: number;
+  feeInUSD: number;
+  buyerFeeInUSD: number;
+  sellerFeeInUSD: number;
+  exchangeRate?: number;
+
   // 🧩 Track joined parties
   joinedBy?: IJoinedBy[];
 
@@ -56,13 +63,20 @@ const EscrowTransactionSchema = new Schema<IEscrowTransaction>(
     buyerEmail: { type: String, required: true },
     sellerEmail: { type: String, required: true },
     brokerEmail: { type: String },
-    brokerAmount: { type: Number, required: true },
+    brokerAmount: { type: Number, default: 0 },
     payerRole: { type: String, required: true },
     item: { type: String, required: true },
     description: { type: String },
     amount: { type: Number, required: true },
     fee: { type: Number, required: true },
     currency: { type: String, required: true },
+
+    // 🆕 Split Fee Fields
+    amountInUSD: { type: Number, required: true }, // Converted amount for internal calculations
+    feeInUSD: { type: Number, required: true }, // Converted and discounted fee
+    buyerFeeInUSD: { type: Number, default: 0 }, // Buyer's portion in split fee
+    sellerFeeInUSD: { type: Number, default: 0 }, // Seller's portion in split fee
+    exchangeRate: { type: Number }, // Exchange rate used for conversion
 
     // 💸 Discounts & claims
     couponCode: { type: String },
@@ -118,7 +132,7 @@ const EscrowTransactionSchema = new Schema<IEscrowTransaction>(
 );
 
 const EscrowTransaction = mongoose.model<IEscrowTransaction>(
-  "EscrowTransaction",
+  "escrowtransactions",
   EscrowTransactionSchema
 );
 

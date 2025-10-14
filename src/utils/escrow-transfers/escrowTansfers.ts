@@ -21,18 +21,20 @@ export const logWalletTransfer = async (
       method,
       amount,
       currency,
-      orderId: `transfer_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      orderId: `transfer_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`,
       description,
       status,
       date: new Date(),
       walletCredited: true,
-      transferInfo
+      transferInfo,
     };
 
     const options = session ? { session } : {};
     const walletTransaction = new WalletTransaction(transactionData);
     await walletTransaction.save(options);
-    
+
     return walletTransaction;
   } catch (error) {
     console.error("Error logging wallet transfer:", error);
@@ -52,7 +54,7 @@ export const logEscrowFunding = async (
   session: any
 ) => {
   const totalAmount = amount + fee;
-  
+
   return await logWalletTransfer(
     payerEmail,
     "withdrawal",
@@ -97,6 +99,37 @@ export const logEscrowReleaseToSeller = async (
       participants,
       originalAmount: amount,
       netAmountAfterFees: amount,
+    },
+    "completed",
+    session
+  );
+};
+
+/**
+ * @desc Log seller fee deduction for split payments
+ */
+export const logSellerFeeDeduction = async (
+  sellerEmail: string,
+  feeAmount: number,
+  escrowTransactionId: string,
+  participants: any,
+  session: any
+) => {
+  return await logWalletTransfer(
+    sellerEmail,
+    "withdrawal",
+    "seller_fee",
+    feeAmount,
+    "USD",
+    `Seller fee deduction for transaction ${escrowTransactionId}`,
+    {
+      fromUser: sellerEmail,
+      escrowTransactionId,
+      transferType: "seller_fee_deduction",
+      participants,
+      feeType: "split_payment",
+      originalAmount: feeAmount,
+      netAmountAfterFees: feeAmount,
     },
     "completed",
     session
