@@ -41,6 +41,9 @@ export interface IEscrowTransaction extends Document {
   // 🧩 Track joined parties
   joinedBy?: IJoinedBy[];
 
+  // ⏰ Maximum check time duration (stores the selected duration string)
+  maxCheckTime?: "1h" | "4h" | "8h" | "24h" | "3d" | "7d" | "30d" | "any";
+
   hasDispute: boolean;
   isPaid: boolean;
   disputeReason?: string;
@@ -103,6 +106,12 @@ const EscrowTransactionSchema = new Schema<IEscrowTransaction>(
         joinedAt: { type: Date, default: Date.now },
       },
     ],
+
+    // ⏰ Maximum check time duration
+    maxCheckTime: {
+      type: String,
+      enum: ["1h", "4h", "8h", "24h", "3d", "7d", "30d", "any"],
+    },
 
     // 💬 Dispute
     hasDispute: { type: Boolean, default: false },

@@ -3,6 +3,7 @@ import {
   deleteEscrowTransaction,
   createEscrowTransaction,
   updateEscrowTransaction,
+  editEscrowTransaction,
   getEscrowTransactions,
 } from "../../controllers/escrow/transactionController";
 import { authenticate } from "../../authenticate-middleware/middleware";
@@ -17,6 +18,9 @@ router.get("/",authenticate, getEscrowTransactions);
 
 // 🔄 Update escrow transaction (status, dispute, etc.)
 router.put("/:id",authenticate, updateEscrowTransaction);
+
+// ✏️ Edit escrow transaction - modify any field
+router.put("/edit/:transactionId", authenticate, editEscrowTransaction);
 
 // ❌ Delete escrow transaction — admin only & no dispute
 router.delete("/:id",authenticate, deleteEscrowTransaction);

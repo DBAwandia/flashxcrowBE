@@ -120,7 +120,7 @@ export const getUsers = async (req: Request, res: Response) => {
 export const getUser = async (req: Request, res: Response): Promise<void> => {
   try {
     const user = await User.findById(req.params.id).select(
-      "email isAdmin isDisabled balance createdAt updatedAt subUserId"
+      "email isAdmin isDisabled balance createdAt updatedAt subUserId walletBalance walletFrozeBalance claimCodes"
     );
 
     if (!user) {
