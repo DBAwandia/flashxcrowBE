@@ -18,9 +18,41 @@ export interface IWalletTransaction extends Document {
     | "cancelled"
     | "partial"
     | "expired"
-    | "refunded";
+    | "refunded"
+    | "rejected"
+    | "frozen"
+    | "disputed"
+    | "approved";
   date: Date;
   walletCredited?: boolean;
+
+  // 🆕 Admin notes and audit trail
+  adminNotes?: string;
+  rejectionReason?: string;
+  cancellationReason?: string;
+  refundReason?: string;
+  disputeDetails?: {
+    caseId?: string;
+    reason?: string;
+    partiesInvolved?: string[];
+    openedAt?: Date;
+    resolvedAt?: Date;
+  };
+  refundInfo?: {
+    originalTransactionId?: string;
+    reason?: string;
+    refundAmount?: number;
+    refundedAt?: Date;
+    adminNotes?: string;
+  };
+  frozenAt?: Date;
+  rejectedAt?: Date;
+  cancelledAt?: Date;
+  refundedAt?: Date;
+  disputedAt?: Date;
+  completedAt?: Date;
+  approvedAt?: Date;
+  updatedBy?: string; // Admin email who last updated
 
   // Payment processor data
   nowPaymentsData?: {
@@ -100,6 +132,8 @@ export interface IWalletTransaction extends Document {
     paidAmount?: number;
     paidCurrency?: string;
     lastWebhookUpdate?: Date;
+    exchangeRate?: number; // For KES to USD conversion
+    amountInKES?: number; // Original KES amount for M-Pesa
   };
 
   // Withdrawal information
@@ -108,6 +142,14 @@ export interface IWalletTransaction extends Document {
     network?: string;
     addressTag?: string;
     phoneNumber?: string;
+  };
+
+  // 🆕 Original request details for tracking
+  originalRequest?: {
+    requestedAmount?: number;
+    requestedCurrency?: string;
+    requestedAmountKES?: number; // For M-Pesa withdrawals
+    exchangeRate?: number;
   };
 }
 
@@ -166,6 +208,10 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
         "partial",
         "expired",
         "refunded",
+        "rejected",
+        "frozen",
+        "disputed",
+        "approved"
       ],
     },
     date: {
@@ -176,6 +222,87 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
     walletCredited: {
       type: Boolean,
       default: false,
+    },
+
+    // 🆕 ADMIN NOTES AND AUDIT TRAIL
+    adminNotes: {
+      type: String,
+      default: ""
+    },
+    rejectionReason: {
+      type: String,
+      default: ""
+    },
+    cancellationReason: {
+      type: String,
+      default: ""
+    },
+    refundReason: {
+      type: String,
+      default: ""
+    },
+    disputeDetails: {
+      type: {
+        caseId: String,
+        reason: String,
+        partiesInvolved: [String],
+        openedAt: Date,
+        resolvedAt: Date
+      },
+      default: null
+    },
+    refundInfo: {
+      type: {
+        originalTransactionId: Schema.Types.ObjectId,
+        reason: String,
+        refundAmount: Number,
+        refundedAt: Date,
+        adminNotes: String
+      },
+      default: null
+    },
+    frozenAt: {
+      type: Date,
+      default: null
+    },
+    rejectedAt: {
+      type: Date,
+      default: null
+    },
+    cancelledAt: {
+      type: Date,
+      default: null
+    },
+    refundedAt: {
+      type: Date,
+      default: null
+    },
+    disputedAt: {
+      type: Date,
+      default: null
+    },
+    completedAt: {
+      type: Date,
+      default: null
+    },
+    approvedAt: {
+      type: Date,
+      default: null
+    },
+    updatedBy: {
+      type: String,
+      default: ""
+    },
+
+    // 🆕 ORIGINAL REQUEST TRACKING
+    originalRequest: {
+      type: {
+        requestedAmount: Number,
+        requestedCurrency: String,
+        requestedAmountKES: Number,
+        exchangeRate: Number
+      },
+      default: {}
     },
 
     // NOW Payments data
@@ -271,6 +398,8 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
         paidAmount: Number,
         paidCurrency: String,
         lastWebhookUpdate: Date,
+        exchangeRate: Number,
+        amountInKES: Number,
       },
       default: null,
     },
@@ -304,9 +433,26 @@ WalletTransactionSchema.index({ "mpesaData.phoneNumber": 1 });
 WalletTransactionSchema.index({ "mpesaData.paymentStatus": 1 });
 WalletTransactionSchema.index({ "transferInfo.escrowTransactionId": 1 });
 
+// 🆕 New indexes for admin features
+WalletTransactionSchema.index({ status: 1, updatedAt: -1 });
+WalletTransactionSchema.index({ "disputeDetails.caseId": 1 });
+WalletTransactionSchema.index({ updatedBy: 1 });
+WalletTransactionSchema.index({ refundedAt: 1 });
+WalletTransactionSchema.index({ frozenAt: 1 });
+
 // Virtuals
 WalletTransactionSchema.virtual("netAmount").get(function () {
   return this.amount - (this.fee || 0);
+});
+
+// 🆕 Virtual for transaction age
+WalletTransactionSchema.virtual("ageInDays").get(function () {
+  return Math.floor((Date.now() - this.date.getTime()) / (1000 * 60 * 60 * 24));
+});
+
+// 🆕 Virtual for dispute status
+WalletTransactionSchema.virtual("isUnderDispute").get(function () {
+  return this.status === 'frozen' || this.status === 'disputed';
 });
 
 // Methods
@@ -328,6 +474,26 @@ WalletTransactionSchema.methods.isPayoutRefunded = function (): boolean {
 
 WalletTransactionSchema.methods.isMpesaProcessed = function (): boolean {
   return this.mpesaData?.processed === true;
+};
+
+// 🆕 New methods for admin operations
+WalletTransactionSchema.methods.canRefund = function (): boolean {
+  return this.status === 'completed' && this.type === 'deposit' && !this.refundedAt;
+};
+
+WalletTransactionSchema.methods.canFreeze = function (): boolean {
+  return ['pending', 'processing', 'completed'].includes(this.status) && !this.frozenAt;
+};
+
+WalletTransactionSchema.methods.canReject = function (): boolean {
+  return this.status === 'pending' || this.status === 'processing';
+};
+
+WalletTransactionSchema.methods.addAdminNote = function (note: string, adminEmail: string) {
+  const timestamp = new Date().toISOString();
+  const newNote = `[${timestamp}] ${adminEmail}: ${note}\n`;
+  this.adminNotes = (this.adminNotes || '') + newNote;
+  this.updatedBy = adminEmail;
 };
 
 // Static methods
@@ -446,6 +612,30 @@ WalletTransactionSchema.statics.getUserTransferHistory = function (
   })
     .sort({ date: -1 })
     .limit(limit);
+};
+
+// 🆕 New static methods for admin features
+WalletTransactionSchema.statics.findTransactionsWithDisputes = function () {
+  return this.find({
+    status: { $in: ['frozen', 'disputed'] }
+  }).sort({ disputedAt: -1 });
+};
+
+WalletTransactionSchema.statics.findRefundedTransactions = function (
+  startDate?: Date,
+  endDate?: Date
+) {
+  const match: any = { status: 'refunded' };
+  if (startDate && endDate) {
+    match.refundedAt = { $gte: startDate, $lte: endDate };
+  }
+  return this.find(match).sort({ refundedAt: -1 });
+};
+
+WalletTransactionSchema.statics.findTransactionsByAdmin = function (
+  adminEmail: string
+) {
+  return this.find({ updatedBy: adminEmail }).sort({ updatedAt: -1 });
 };
 
 export const WalletTransaction = mongoose.model<IWalletTransaction>(

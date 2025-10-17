@@ -1051,9 +1051,9 @@ export const createWithdrawal = async (
       address,
       phoneNumber,
       addressTag,
-      note,
       userEmail,
     } = req.body;
+    console.log(method, currency);
 
     if (!userEmail) {
       res.status(401).json({ message: "User not authenticated" });
@@ -1067,6 +1067,27 @@ export const createWithdrawal = async (
       return;
     }
 
+    // ✅ Ensure request has a logged-in user
+    if (!req?.user || !req?.user?.email) {
+      res.status(401).json({ message: "User not authenticated" });
+      return;
+    }
+
+    // ✅ Check if the requesting user is the same as the userEmail in the body
+    if (
+      userEmail &&
+      userEmail.toLowerCase() !== req.user?.email.toLowerCase()
+    ) {
+      res.status(403).json({
+        message:
+          "Forbidden: You can only initiate withdrawals for your own account",
+      });
+      return;
+    }
+
+    // ✅ Always use the authenticated user's email to avoid spoofing
+    const effectiveEmail = req.user?.email;
+
     // Validate amount
     const amountNum = parseFloat(amount);
     if (isNaN(amountNum) || amountNum <= 0) {
@@ -1074,10 +1095,79 @@ export const createWithdrawal = async (
       return;
     }
 
-    // Check user balance
-    const user = await User.findOne({ email: userEmail });
-    if (!user || user.walletBalance < amountNum) {
-      res.status(400).json({ message: "Insufficient balance" });
+    // Get current exchange rate (you should fetch this from your database or API)
+    const EXCHANGE_RATE = 130; // 1 USD = 130 KES
+
+    let amountToDeductUSD = amountNum;
+    let amountInKES = amountNum;
+
+    // Handle M-Pesa withdrawals with currency conversion
+    if (method === "mpesa") {
+      if (!phoneNumber) {
+        res
+          .status(400)
+          .json({ message: "Phone number is required for M-Pesa withdrawals" });
+        return;
+      }
+
+      // If currency is KES, convert to USD for balance check
+      if (currency.toUpperCase() === "KES") {
+        amountToDeductUSD = amountNum / EXCHANGE_RATE;
+        amountInKES = amountNum;
+      }
+      // If currency is USD, convert to KES for M-Pesa
+      else if (currency.toUpperCase() === "USD") {
+        amountInKES = amountNum * EXCHANGE_RATE;
+        amountToDeductUSD = amountNum;
+      } else {
+        res.status(400).json({
+          message: "M-Pesa withdrawals only support USD and KES currencies",
+        });
+        return;
+      }
+
+      // Validate minimum withdrawal amount for M-Pesa
+      const minWithdrawalKES = 300; // Minimum 100 KES
+      if (amountInKES < minWithdrawalKES) {
+        res.status(400).json({
+          message: `Minimum M-Pesa withdrawal amount is KES ${minWithdrawalKES}`,
+        });
+        return;
+      }
+
+      console.log(
+        `M-Pesa withdrawal: ${amountInKES} KES = ${amountToDeductUSD} USD`
+      );
+    } else if (method === "cryptocurrency") {
+      // For crypto withdrawals, amount should be in USD
+      if (currency.toUpperCase() !== "USD") {
+        res.status(400).json({
+          message: "Cryptocurrency withdrawals only support USD currency",
+        });
+        return;
+      }
+
+      // Validate minimum withdrawal amount for crypto
+      const minWithdrawalUSD = 11; // Minimum $10
+      if (amountNum < minWithdrawalUSD) {
+        res.status(400).json({
+          message: `Minimum cryptocurrency withdrawal amount is $${minWithdrawalUSD}`,
+        });
+        return;
+      }
+    }
+
+    // Check user balance in USD (wallet balance is stored in USD)
+    const user = await User.findOne({ email: effectiveEmail });
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    if (user.walletBalance < amountToDeductUSD) {
+      res.status(400).json({
+        message: `Insufficient balance.`,
+      });
       return;
     }
 
@@ -1085,11 +1175,11 @@ export const createWithdrawal = async (
     const orderId = await generateUniqueOrderId(WalletTransaction, "NW", 8);
 
     let transactionData: any = {
-      userEmail,
+      userEmail: effectiveEmail,
       type: "withdrawal",
       method,
-      amount: amountNum,
-      currency: currency.toUpperCase(),
+      amount: amountToDeductUSD, // Store in USD for consistency
+      currency: "USD", // Always store in USD in database
       fee: 0,
       status: "pending",
       date: new Date(),
@@ -1124,63 +1214,6 @@ export const createWithdrawal = async (
 
       const payoutCurrency = getCurrencyCode(network);
 
-      // ✅ Prepare NOW Payments payout payload according to API docs
-      const payoutPayload = {
-        withdrawals: [
-          {
-            address: address,
-            currency: payoutCurrency,
-            amount: amountNum,
-            ...(addressTag && { extra_id: addressTag }),
-            ...(note && { payout_description: note }),
-            unique_external_id: orderId,
-          },
-        ],
-        ipn_callback_url: process.env.NOW_PAYMENTS_IPN_URL,
-        ...(note && { payout_description: note }),
-      };
-
-      console.log(
-        "📤 Creating NOW Payments payout:",
-        JSON.stringify(payoutPayload, null, 2)
-      );
-
-      const payoutResponse = await nowPaymentsService.createPayout(
-        payoutPayload
-      );
-
-      console.log("📥 NOW Payments payout response:", payoutResponse);
-
-      // ✅ Validate payout response
-      if (
-        !payoutResponse ||
-        !Array.isArray(payoutResponse) ||
-        payoutResponse.length === 0
-      ) {
-        console.error("❌ Invalid payout response:", payoutResponse);
-        res.status(400).json({
-          message: "Invalid response from payment provider",
-          details: payoutResponse,
-        });
-        return;
-      }
-
-      const payout = payoutResponse[0]; // Get first payout from array
-
-      // ✅ Store NOW Payments payout data
-      transactionData.nowPaymentsWithdrawalData = {
-        payoutId: payout.id,
-        withdrawalId: orderId,
-        payoutStatus: payout.status,
-        address: payout.address,
-        amount: payout.amount,
-        currency: payout.currency,
-        extraId: addressTag,
-        payoutDescription: note,
-        uniqueExternalId: orderId,
-        createdAt: new Date(),
-      };
-
       transactionData.description = `Cryptocurrency withdrawal to ${address} (${network.toUpperCase()})`;
       transactionData.counterparty = address;
       transactionData.withdrawalInfo = {
@@ -1190,50 +1223,34 @@ export const createWithdrawal = async (
         currency: payoutCurrency,
       };
 
-      // ✅ Map NOW Payments status to our status
-      const statusMap: { [key: string]: string } = {
-        creating: "pending",
-        waiting: "pending",
-        processing: "processing",
-        sending: "processing",
-        finished: "completed",
-        failed: "failed",
-        rejected: "failed",
+      // Store original requested amount and currency for reference
+      transactionData.originalRequest = {
+        requestedAmount: amountNum,
+        requestedCurrency: currency.toUpperCase(),
+        exchangeRate: method === "mpesa" ? EXCHANGE_RATE : undefined,
       };
-
-      transactionData.status = statusMap[payout.status] || "pending";
     } else if (method === "mpesa") {
-      if (!phoneNumber) {
-        res
-          .status(400)
-          .json({ message: "Phone number is required for M-Pesa withdrawals" });
-        return;
-      }
-
-      // For M-Pesa, we might use a different integration
       transactionData.mpesaData = {
         phoneNumber,
         orderId,
+        amountInKES: amountInKES, // Store the actual KES amount sent to M-Pesa
+        exchangeRate: EXCHANGE_RATE,
       };
 
       transactionData.description = `M-Pesa withdrawal to ${phoneNumber}`;
       transactionData.counterparty = phoneNumber;
 
-      // TODO: Integrate with actual M-Pesa payout API
-      // Simulate processing for now
-      setTimeout(async () => {
-        try {
-          await WalletTransaction.findByIdAndUpdate(transaction._id, {
-            status: "completed",
-            "mpesaData.processed": true,
-          });
-          console.log(
-            `M-Pesa withdrawal completed for user: ${userEmail}, amount: ${amount}`
-          );
-        } catch (error) {
-          console.error("Error updating M-Pesa withdrawal:", error);
-        }
-      }, 5000);
+      // Store original requested amount and currency for reference
+      transactionData.originalRequest = {
+        requestedAmount: amountNum,
+        requestedCurrency: currency.toUpperCase(),
+        requestedAmountKES: amountInKES,
+        exchangeRate: EXCHANGE_RATE,
+      };
+
+      console.log(
+        `M-Pesa withdrawal created: ${amountInKES} KES ($${amountToDeductUSD} USD) to ${phoneNumber}`
+      );
     } else {
       res.status(400).json({ message: "Unsupported withdrawal method" });
       return;
@@ -1241,15 +1258,36 @@ export const createWithdrawal = async (
 
     const transaction = await WalletTransaction.create(transactionData);
 
-    // ✅ Deduct from user balance immediately for withdrawals
+    // ✅ Deduct from user balance immediately for withdrawals (always in USD)
     await User.findOneAndUpdate(
-      { email: userEmail },
-      { $inc: { walletBalance: -amountNum } }
+      { email: effectiveEmail },
+      { $inc: { walletBalance: -amountToDeductUSD } }
     );
+
+    // Prepare response based on method
+    let responseMessage = "Withdrawal initiated successfully";
+    let responseDetails: any = {};
+
+    if (method === "mpesa") {
+      responseMessage = `M-Pesa withdrawal of KES ${amountInKES} initiated successfully`;
+      responseDetails = {
+        amountKES: amountInKES,
+        amountUSD: amountToDeductUSD,
+        exchangeRate: EXCHANGE_RATE,
+        phoneNumber: phoneNumber,
+      };
+    } else if (method === "cryptocurrency") {
+      responseMessage = `Cryptocurrency withdrawal of $${amountNum} initiated successfully`;
+      responseDetails = {
+        amountUSD: amountNum,
+        network: network,
+        address: address,
+      };
+    }
 
     res.json({
       success: true,
-      message: "Withdrawal initiated successfully",
+      message: responseMessage,
       transaction: {
         id: transaction._id,
         orderId: transaction.orderId,
@@ -1258,8 +1296,8 @@ export const createWithdrawal = async (
         status: transaction.status,
         method: transaction.method,
         description: transaction.description,
-        nowPaymentsWithdrawalData: transaction.nowPaymentsWithdrawalData,
       },
+      ...responseDetails,
     });
   } catch (error: any) {
     console.error("Withdrawal creation error:", error);
@@ -1267,11 +1305,28 @@ export const createWithdrawal = async (
     // ✅ Refund user balance if withdrawal creation failed
     if (req.user?.email) {
       try {
-        await User.findOneAndUpdate(
-          { email: req.user.email },
-          { $inc: { walletBalance: parseFloat(req.body.amount) } }
-        );
-        console.log("💰 Refunded user balance after withdrawal failure");
+        // Parse the original amount from request
+        const originalAmount = parseFloat(req.body.amount);
+        const method = req.body.method;
+        const currency = req.body.currency;
+
+        let amountToRefund = originalAmount;
+
+        // If it was an M-Pesa withdrawal in KES, convert back to USD for refund
+        if (method === "mpesa" && currency.toUpperCase() === "KES") {
+          const EXCHANGE_RATE = 130;
+          amountToRefund = originalAmount / EXCHANGE_RATE;
+        }
+
+        if (!isNaN(amountToRefund)) {
+          await User.findOneAndUpdate(
+            { email: req.user.email },
+            { $inc: { walletBalance: amountToRefund } }
+          );
+          console.log(
+            `💰 Refunded ${amountToRefund} USD to user balance after withdrawal failure`
+          );
+        }
       } catch (refundError) {
         console.error("Error refunding user balance:", refundError);
       }
@@ -1279,7 +1334,7 @@ export const createWithdrawal = async (
 
     // Provide more specific error messages
     if (error.response?.data) {
-      console.error("NOW Payments API error:", error.response.data);
+      console.error("Payment API error:", error.response.data);
       res.status(400).json({
         message: "Withdrawal failed",
         details: error.response.data,
@@ -1291,63 +1346,538 @@ export const createWithdrawal = async (
   }
 };
 
-// Other existing functions remain the same...
-export const createWalletTransaction = async (req: Request, res: Response) => {
-  try {
-    const {
-      userEmail,
-      type,
-      method,
-      amount,
-      currency,
-      description,
-      counterparty,
-      fee,
-      withdrawalInfo,
-      bonus,
-    } = req.body;
-
-    const transaction = await WalletTransaction.create({
-      userEmail,
-      type,
-      method,
-      amount,
-      currency,
-      description,
-      counterparty,
-      fee,
-      withdrawalInfo,
-      bonus,
-      status: "pending",
-      date: new Date(),
-    });
-
-    res.status(201).json({ success: true, transaction });
-  } catch (error) {
-    handleServerError(res, error, "Error creating wallet transaction");
-  }
-};
-
 export const updateWalletTransaction = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const updateData = req.body;
+    const { status, reason, disputeDetails, refundAmount, adminNotes } =
+      updateData;
 
-    const transaction = await WalletTransaction.findByIdAndUpdate(
-      id,
-      updateData,
-      { new: true }
-    );
-
+    // Find the transaction first
+    const transaction = await WalletTransaction.findById(id);
     if (!transaction) {
       res.status(404).json({ message: "Transaction not found" });
       return;
     }
 
-    res.json({ success: true, transaction });
+    const user = await User.findOne({ email: transaction.userEmail });
+    if (!user) {
+      res.status(404).json({ message: "User not found" });
+      return;
+    }
+
+    let updatedTransaction;
+    let userUpdates: any = {};
+    let refundTransaction = null;
+
+    // Handle different status updates
+    switch (status) {
+      case "rejected":
+        await handleRejectedTransaction(transaction, user, reason, adminNotes);
+        break;
+
+      case "refunded":
+        refundTransaction = await handleRefundedTransaction(
+          transaction,
+          user,
+          refundAmount,
+          reason,
+          adminNotes
+        );
+        break;
+
+      case "approved":
+        await handleApprovedTransaction(transaction, user, adminNotes);
+        break;
+
+      case "cancelled":
+        await handleCancelledTransaction(transaction, user, reason, adminNotes);
+        break;
+
+      case "frozen":
+        await handleFrozenTransaction(
+          transaction,
+          user,
+          disputeDetails,
+          adminNotes
+        );
+        break;
+      case "resolve":
+      case "resolved":
+        await handleResolveDisputeTransaction(transaction, user, adminNotes);
+        break;
+
+      case "unfrozen":
+        await handleUnfrozenTransaction(transaction, user, adminNotes);
+        break;
+
+      case "disputed":
+        await handleDisputedTransaction(
+          transaction,
+          user,
+          disputeDetails,
+          adminNotes
+        );
+        break;
+
+      default:
+        updatedTransaction = await WalletTransaction.findByIdAndUpdate(
+          id,
+          {
+            ...updateData,
+            updatedAt: new Date(),
+          },
+          { new: true }
+        );
+    }
+
+    // Update user if there are any changes
+    if (Object.keys(userUpdates).length > 0) {
+      await User.findByIdAndUpdate(user._id, userUpdates);
+    }
+
+    // If we haven't updated the transaction in the specific handlers, do it now
+    if (!updatedTransaction) {
+      updatedTransaction = await WalletTransaction.findByIdAndUpdate(
+        id,
+        {
+          ...updateData,
+          updatedAt: new Date(),
+        },
+        { new: true }
+      );
+    }
+
+    const response: any = {
+      success: true,
+      transaction: updatedTransaction,
+      message: `Transaction ${status} successfully`,
+    };
+
+    if (refundTransaction) {
+      response.refundTransaction = refundTransaction;
+    }
+
+    res.json(response);
   } catch (error) {
+    console.error("Error updating wallet transaction:", error);
     handleServerError(res, error, "Error updating wallet transaction");
   }
+};
+
+// Helper functions for different status cases
+const handleRejectedTransaction = async (
+  transaction: any,
+  user: any,
+  reason: string,
+  adminNotes?: string
+) => {
+  // For withdrawals: refund the amount to user's wallet
+  if (transaction.type === "withdrawal") {
+    const refundAmount = transaction.amount;
+
+    await User.findByIdAndUpdate(user._id, {
+      $inc: { walletBalance: refundAmount },
+      $set: { updatedAt: new Date() },
+    });
+
+    // Create a refund transaction record
+    const refundOrderId = await generateUniqueOrderId(
+      WalletTransaction,
+      "RF",
+      8
+    );
+    await WalletTransaction.create({
+      userEmail: user.email,
+      type: "deposit",
+      method: "refund",
+      amount: refundAmount,
+      currency: transaction.currency,
+      orderId: refundOrderId,
+      description: `Refund for rejected withdrawal: ${reason}`,
+      status: "completed",
+      date: new Date(),
+      walletCredited: true,
+      refundInfo: {
+        originalTransactionId: transaction._id,
+        reason: reason,
+        adminNotes: adminNotes,
+      },
+    });
+
+    console.log(
+      `💰 Refunded $${refundAmount} to user ${user.email} for rejected withdrawal`
+    );
+  }
+
+  // Update the original transaction
+  await WalletTransaction.findByIdAndUpdate(transaction._id, {
+    status: "rejected",
+    rejectionReason: reason,
+    adminNotes: adminNotes,
+    updatedAt: new Date(),
+  });
+};
+
+const handleRefundedTransaction = async (
+  transaction: any,
+  user: any,
+  refundAmount: number,
+  reason: string,
+  adminNotes?: string
+) => {
+  try {
+    // Validate transaction status - only allow refunds for pending transactions
+    if (transaction.status !== "pending") {
+      throw new Error(
+        `Cannot refund transaction with status: ${transaction.status}. Only pending transactions can be refunded.`
+      );
+    }
+
+    // Validate refund amount
+    const actualRefundAmount = refundAmount || transaction.amount;
+    if (actualRefundAmount <= 0) {
+      throw new Error("Refund amount must be greater than 0");
+    }
+
+    if (actualRefundAmount > transaction.amount) {
+      throw new Error(
+        `Refund amount (${actualRefundAmount}) cannot exceed original transaction amount (${transaction.amount})`
+      );
+    }
+
+    // Use transaction to ensure atomic operations
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Refund to user's wallet
+      await User.findByIdAndUpdate(
+        user._id,
+        {
+          $inc: { walletBalance: actualRefundAmount },
+          $set: { updatedAt: new Date() },
+        },
+        { session }
+      );
+
+      // Create refund transaction
+      const refundOrderId = await generateUniqueOrderId(
+        WalletTransaction,
+        "RF",
+        8
+      );
+      const refundTransaction = await WalletTransaction.create(
+        [
+          {
+            userEmail: user.email,
+            type: "deposit",
+            method: "refund",
+            amount: actualRefundAmount,
+            currency: transaction.currency,
+            orderId: refundOrderId,
+            description: `Refund: ${reason}`,
+            status: "completed",
+            date: new Date(),
+            walletCredited: true,
+            refundInfo: {
+              originalTransactionId: transaction._id,
+              reason: reason,
+              refundAmount: actualRefundAmount,
+              adminNotes: adminNotes,
+            },
+          },
+        ],
+        { session }
+      );
+
+      // Update original transaction
+      await WalletTransaction.findByIdAndUpdate(
+        transaction._id,
+        {
+          status: "refunded",
+          refundReason: reason,
+          refundAmount: actualRefundAmount,
+          adminNotes: adminNotes,
+          refundedAt: new Date(),
+          updatedAt: new Date(),
+        },
+        { session }
+      );
+
+      // Commit the transaction
+      await session.commitTransaction();
+      session.endSession();
+
+      console.log(`💰 Refunded $${actualRefundAmount} to user ${user.email}`);
+      return refundTransaction[0];
+    } catch (error) {
+      // Abort transaction on any error
+      await session.abortTransaction();
+      session.endSession();
+      throw error; // Re-throw to be caught by outer catch
+    }
+  } catch (error) {
+    throw new Error(`Refund processing failed: ${error}`);
+  }
+};
+
+const handleCancelledTransaction = async (
+  transaction: any,
+  user: any,
+  reason: string,
+  adminNotes?: string
+) => {
+  // Refund if it was a withdrawal that was processing
+  if (transaction.type === "withdrawal" && transaction.status === "pending") {
+    await User.findByIdAndUpdate(user._id, {
+      $inc: { walletBalance: transaction.amount },
+      $set: { updatedAt: new Date() },
+    });
+
+    console.log(
+      `💰 Refunded $${transaction.amount} to user ${user.email} for cancelled withdrawal`
+    );
+  }
+
+  await WalletTransaction.findByIdAndUpdate(transaction._id, {
+    status: "cancelled",
+    cancellationReason: reason,
+    adminNotes: adminNotes,
+    cancelledAt: new Date(),
+    updatedAt: new Date(),
+  });
+};
+
+const handleApprovedTransaction = async (
+  transaction: any,
+  user: any,
+  adminNotes?: string
+) => {
+  try {
+    // Validate transaction status - only allow approval for pending or unfrozen transactions
+    if (transaction.status !== "pending" && transaction.status !== "unfrozen") {
+      throw new Error(
+        `Cannot approve transaction with status: ${transaction.status}. Only pending or unfrozen transactions can be approved.`
+      );
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Update transaction status to approved
+      await WalletTransaction.findByIdAndUpdate(
+        transaction._id,
+        {
+          status: "approved",
+          adminNotes: adminNotes,
+          updatedAt: new Date(),
+          approvedAt: new Date(),
+        },
+        { session }
+      );
+
+      await session.commitTransaction();
+      session.endSession();
+
+      console.log(
+        `✅ Approved transaction ${transaction._id} for user ${user.email}`
+      );
+    } catch (error) {
+      await session.abortTransaction();
+      session.endSession();
+      throw error;
+    }
+  } catch (error) {
+    console.error("❌ Transaction approval failed:", error);
+    throw new Error(`Transaction approval failed: ${error}`);
+  }
+};
+
+const handleFrozenTransaction = async (
+  transaction: any,
+  user: any,
+  disputeDetails: any,
+  adminNotes?: string
+) => {
+  try {
+    // Validate user has sufficient balance
+    const freezeAmount = transaction.amount;
+    if (user.walletBalance < freezeAmount) {
+      throw new Error(
+        `Insufficient balance. User has $${user.walletBalance}, but trying to freeze $${freezeAmount}`
+      );
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Freeze the amount in user's wallet
+      await User.findByIdAndUpdate(
+        user._id,
+        {
+          $inc: {
+            walletBalance: -freezeAmount,
+            walletFrozenBalance: freezeAmount,
+          },
+          $set: {
+            hasDispute: true,
+            updatedAt: new Date(),
+          },
+        },
+        { session }
+      );
+
+      await WalletTransaction.findByIdAndUpdate(
+        transaction._id,
+        {
+          status: "frozen",
+          disputeDetails: disputeDetails,
+          adminNotes: adminNotes,
+          frozenAt: new Date(),
+          updatedAt: new Date(),
+        },
+        { session }
+      );
+
+      await session.commitTransaction();
+      session.endSession();
+
+      console.log(
+        `❄️ Froze $${freezeAmount} for user ${user.email} due to dispute`
+      );
+    } catch (error) {
+      await session.abortTransaction();
+      session.endSession();
+      throw error;
+    }
+  } catch (error) {
+    console.error("❌ Transaction freeze failed:", error);
+    throw new Error(`Transaction freeze failed: ${error}`);
+  }
+};
+
+export const handleResolveDisputeTransaction = async (
+  transaction: any,
+  user: any,
+  adminNotes?: string
+) => {
+  transaction.isUnderDispute = false;
+  transaction.status = "completed"; // or restore original status if you store it
+  transaction.disputeDetails = null;
+  transaction.adminNotes = adminNotes || "Dispute resolved by admin.";
+  transaction.updatedAt = new Date();
+
+  await transaction.save();
+
+  return transaction;
+};
+
+const handleUnfrozenTransaction = async (
+  transaction: any,
+  user: any,
+  adminNotes?: string
+) => {
+  try {
+    // Validate transaction status - only allow unfreezing for frozen transactions
+    if (transaction.status !== "frozen") {
+      throw new Error(
+        `Cannot unfreeze transaction with status: ${transaction.status}. Only frozen transactions can be unfrozen.`
+      );
+    }
+
+    // Validate user has sufficient frozen balance
+    const unfreezeAmount = transaction.amount;
+    if (user.walletFrozenBalance < unfreezeAmount) {
+      throw new Error(
+        `Insufficient frozen balance. User has $${user.walletFrozenBalance} frozen, but trying to unfreeze $${unfreezeAmount}`
+      );
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Move funds from frozen back to available wallet balance
+      await User.findByIdAndUpdate(
+        user._id,
+        {
+          $inc: {
+            walletBalance: unfreezeAmount,
+            walletFrozenBalance: -unfreezeAmount,
+          },
+          $set: {
+            hasDispute: false,
+            updatedAt: new Date(),
+          },
+        },
+        { session }
+      );
+
+      await WalletTransaction.findByIdAndUpdate(
+        transaction._id,
+        {
+          status: "unfrozen",
+          adminNotes: adminNotes,
+          unfrozenAt: new Date(),
+          updatedAt: new Date(),
+        },
+        { session }
+      );
+
+      await session.commitTransaction();
+      session.endSession();
+
+      console.log(
+        `✅ Unfroze $${unfreezeAmount} for user ${user.email}, funds restored`
+      );
+    } catch (error) {
+      await session.abortTransaction();
+      session.endSession();
+      throw error;
+    }
+  } catch (error) {
+    console.error("❌ Transaction unfreeze failed:", error);
+    throw new Error(`Transaction unfreeze failed: ${error}`);
+  }
+};
+
+export const handleDisputedTransaction = async (
+  transaction: any,
+  user: any,
+  disputeDetails: any,
+  adminNotes?: string
+) => {
+  // ✅ Only allow dispute for approved or completed transactions
+  if (!["approved", "completed"].includes(transaction.status)) {
+    throw new Error(
+      `Only approved or completed transactions can be disputed. Current status: ${transaction.status}`
+    );
+  }
+
+  // ✅ Mark user as having a dispute
+  await User.findByIdAndUpdate(user._id, {
+    $set: {
+      hasDispute: true,
+      updatedAt: new Date(),
+    },
+  });
+
+  // ✅ Update transaction dispute details
+  await WalletTransaction.findByIdAndUpdate(transaction._id, {
+    $set: {
+      isUnderDispute: true,
+      status: "disputed",
+      disputeDetails,
+      adminNotes,
+      disputedAt: new Date(),
+      updatedAt: new Date(),
+    },
+  });
+
+  console.log(`⚖️ Marked transaction as disputed for user ${user.email}`);
 };
 
 export const deleteWalletTransaction = async (req: Request, res: Response) => {
