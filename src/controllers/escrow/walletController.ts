@@ -11,6 +11,7 @@ import { verifyNowPaymentsSignature } from "../../utils/nowpayments/verifyNowPay
 import { formatPhoneNumber } from "../../utils/formartPhonenumber";
 import { createKopoKopoChargeService } from "../../services/kopokopoMpesa";
 import * as crypto from "crypto";
+import { exchangeRate } from "../../utils/conversion";
 
 export const getWalletTransactions = async (
   req: AuthenticatedRequest,
@@ -24,26 +25,52 @@ export const getWalletTransactions = async (
 
     const filter: any = {};
     const isAdmin = req?.user?.isAdmin;
+    const requesterEmail = req.user?.email;
 
-    // Restrict to own transactions if not admin
-    if (!isAdmin && req.user?.email) {
-      filter.userEmail = req.user.email;
-    } else if (userEmail) {
-      filter.userEmail = userEmail;
+    // --- 🧠 Load current user info (to check for claim codes) ---
+    const currentUser = await User.findOne({ email: requesterEmail }).lean();
+    const hasClaimCodes =
+      currentUser?.claimCodes?.some((code) => code.isActive) ?? false;
+
+    // --- 🔍 Apply filters based on user role ---
+    if (isAdmin) {
+      // Admin → see all transactions
+      if (userEmail) filter.userEmail = userEmail;
+    } else {
+      // Normal or coupon user → restricted
+      filter.userEmail = requesterEmail;
+
+      if (hasClaimCodes) {
+        // show deposit, withdrawal, and claim logs
+        filter.$or = [
+          { type: { $in: ["deposit", "withdrawal"] } },
+          {
+            "transferInfo.transferType": {
+              $in: ["claim_reward", "claim_remaining"],
+            },
+          },
+        ];
+      } else {
+        // show only deposit and withdrawal
+        filter.type = { $in: ["deposit", "withdrawal"] };
+      }
     }
 
+    // --- 🧾 Optional filters ---
     if (status) filter.status = status;
 
-    // Search by description, counterparty, or bonus name
     if (search) {
       const searchRegex = new RegExp(search as string, "i");
-      filter.$or = [
+      filter.$or = filter.$or || [];
+      filter.$or.push(
         { description: searchRegex },
         { counterparty: searchRegex },
         { "bonus.name": searchRegex },
-      ];
+        { "transferInfo.claimCodeUsed": searchRegex }
+      );
     }
 
+    // --- 📦 Query transactions ---
     const transactions = await WalletTransaction.find(filter)
       .skip((pageNumber - 1) * limitNumber)
       .limit(limitNumber)
@@ -52,6 +79,7 @@ export const getWalletTransactions = async (
     const totalTransactions = await WalletTransaction.countDocuments(filter);
 
     res.json({
+      success: true,
       totalTransactions,
       page: pageNumber,
       totalPages: Math.ceil(totalTransactions / limitNumber),
@@ -904,7 +932,7 @@ export const handleKopoKopoWebhook = async (req: Request, res: Response) => {
       await creditUserWallet(
         transaction.userEmail,
         transaction.amount.toString(),
-        "USD",
+        transaction.currency,
         orderId
       );
       console.log("💳 Wallet credited successfully");
@@ -956,25 +984,47 @@ async function creditUserWallet(
       return;
     }
 
-    // Update user balance
+    // 🔁 Currency conversion: if KES, convert to USD (1 USD = 130 KES)
+    let creditedAmount = Number(amount);
+    let creditedCurrency = currency.toUpperCase();
+
+    if (creditedCurrency === "KES") {
+      creditedAmount = creditedAmount / exchangeRate;
+      creditedCurrency = "USD";
+      console.log(
+        `💱 Converted KES ${amount} → USD ${creditedAmount.toFixed(2)}`
+      );
+    }
+
+    // 💰 Update user balance
     await User.findOneAndUpdate(
       { email },
       {
-        $inc: { walletBalance: Number(amount), paymentCount: 1 },
+        $inc: { walletBalance: creditedAmount, paymentCount: 1 },
         $set: { lastTransactionDate: new Date() },
       },
       { session }
     );
 
-    // Mark transaction as credited
+    // ✅ Mark transaction as credited
     await WalletTransaction.findOneAndUpdate(
       { orderId },
-      { $set: { walletCredited: true } },
+      {
+        $set: {
+          walletCredited: true,
+          creditedAmount,
+          creditedCurrency,
+        },
+      },
       { session }
     );
 
     await session.commitTransaction();
-    console.log(`💰 Wallet credited for ${email}: +${amount} ${currency}`);
+    console.log(
+      `💰 Wallet credited for ${email}: +${creditedAmount.toFixed(
+        2
+      )} ${creditedCurrency}`
+    );
   } catch (err) {
     await session.abortTransaction();
     console.error("❌ Wallet crediting failed:", err);

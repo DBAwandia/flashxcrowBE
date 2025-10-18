@@ -41,6 +41,9 @@ export interface IEscrowTransaction extends Document {
   // 🧩 Track joined parties
   joinedBy?: IJoinedBy[];
 
+  // 🧍‍♂️ Who created this transaction
+  createdBy: string;
+
   // ⏰ Maximum check time duration (stores the selected duration string)
   maxCheckTime?: "1h" | "4h" | "8h" | "24h" | "3d" | "7d" | "30d" | "any";
 
@@ -75,11 +78,11 @@ const EscrowTransactionSchema = new Schema<IEscrowTransaction>(
     currency: { type: String, required: true },
 
     // 🆕 Split Fee Fields
-    amountInUSD: { type: Number, required: true }, // Converted amount for internal calculations
-    feeInUSD: { type: Number, required: true }, // Converted and discounted fee
-    buyerFeeInUSD: { type: Number, default: 0 }, // Buyer's portion in split fee
-    sellerFeeInUSD: { type: Number, default: 0 }, // Seller's portion in split fee
-    exchangeRate: { type: Number }, // Exchange rate used for conversion
+    amountInUSD: { type: Number, required: true },
+    feeInUSD: { type: Number, required: true },
+    buyerFeeInUSD: { type: Number, default: 0 },
+    sellerFeeInUSD: { type: Number, default: 0 },
+    exchangeRate: { type: Number },
 
     // 💸 Discounts & claims
     couponCode: { type: String },
@@ -89,10 +92,13 @@ const EscrowTransactionSchema = new Schema<IEscrowTransaction>(
       code: { type: String },
       reward: { type: Number },
       percentage: { type: Number },
-      claimedBy: { type: String }, // ✅ user email or ID
-      usageCount: { type: Number, default: 1 }, // ✅ how many times used
+      claimedBy: { type: String },
+      usageCount: { type: Number, default: 1 },
     },
     isClaimed: { type: Boolean, default: false },
+
+    // 🧍‍♂️ Creator info
+    createdBy: { type: String, required: true, index: true },
 
     // 🧩 Joining escrow
     joinedBy: [

@@ -211,7 +211,7 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
         "rejected",
         "frozen",
         "disputed",
-        "approved"
+        "approved",
       ],
     },
     date: {
@@ -227,19 +227,19 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
     // 🆕 ADMIN NOTES AND AUDIT TRAIL
     adminNotes: {
       type: String,
-      default: ""
+      default: "",
     },
     rejectionReason: {
       type: String,
-      default: ""
+      default: "",
     },
     cancellationReason: {
       type: String,
-      default: ""
+      default: "",
     },
     refundReason: {
       type: String,
-      default: ""
+      default: "",
     },
     disputeDetails: {
       type: {
@@ -247,9 +247,9 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
         reason: String,
         partiesInvolved: [String],
         openedAt: Date,
-        resolvedAt: Date
+        resolvedAt: Date,
       },
-      default: null
+      default: null,
     },
     refundInfo: {
       type: {
@@ -257,52 +257,41 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
         reason: String,
         refundAmount: Number,
         refundedAt: Date,
-        adminNotes: String
+        adminNotes: String,
       },
-      default: null
+      default: null,
     },
     frozenAt: {
       type: Date,
-      default: null
+      default: null,
     },
     rejectedAt: {
       type: Date,
-      default: null
+      default: null,
     },
     cancelledAt: {
       type: Date,
-      default: null
+      default: null,
     },
     refundedAt: {
       type: Date,
-      default: null
+      default: null,
     },
     disputedAt: {
       type: Date,
-      default: null
+      default: null,
     },
     completedAt: {
       type: Date,
-      default: null
+      default: null,
     },
     approvedAt: {
       type: Date,
-      default: null
+      default: null,
     },
     updatedBy: {
       type: String,
-      default: ""
-    },
-
-    // 🆕 ORIGINAL REQUEST TRACKING
-    originalRequest: {
-      type: {
-        requestedAmount: Number,
-        requestedCurrency: String,
-        requestedAmountKES: Number,
-        exchangeRate: Number
-      },
-      default: {}
+      default: "",
     },
 
     // NOW Payments data
@@ -366,7 +355,12 @@ const WalletTransactionSchema = new Schema<IWalletTransaction>(
             "escrow_release",
             "escrow_refund",
             "claim_reward",
+            "claim_remaining",
             "broker_commission",
+            "cancellation_fee",
+            "reopen",
+            "escrow_dispute",
+            "seller_fee_payment"
           ],
         },
         participants: {
@@ -452,7 +446,7 @@ WalletTransactionSchema.virtual("ageInDays").get(function () {
 
 // 🆕 Virtual for dispute status
 WalletTransactionSchema.virtual("isUnderDispute").get(function () {
-  return this.status === 'frozen' || this.status === 'disputed';
+  return this.status === "frozen" || this.status === "disputed";
 });
 
 // Methods
@@ -478,21 +472,29 @@ WalletTransactionSchema.methods.isMpesaProcessed = function (): boolean {
 
 // 🆕 New methods for admin operations
 WalletTransactionSchema.methods.canRefund = function (): boolean {
-  return this.status === 'completed' && this.type === 'deposit' && !this.refundedAt;
+  return (
+    this.status === "completed" && this.type === "deposit" && !this.refundedAt
+  );
 };
 
 WalletTransactionSchema.methods.canFreeze = function (): boolean {
-  return ['pending', 'processing', 'completed'].includes(this.status) && !this.frozenAt;
+  return (
+    ["pending", "processing", "completed"].includes(this.status) &&
+    !this.frozenAt
+  );
 };
 
 WalletTransactionSchema.methods.canReject = function (): boolean {
-  return this.status === 'pending' || this.status === 'processing';
+  return this.status === "pending" || this.status === "processing";
 };
 
-WalletTransactionSchema.methods.addAdminNote = function (note: string, adminEmail: string) {
+WalletTransactionSchema.methods.addAdminNote = function (
+  note: string,
+  adminEmail: string
+) {
   const timestamp = new Date().toISOString();
   const newNote = `[${timestamp}] ${adminEmail}: ${note}\n`;
-  this.adminNotes = (this.adminNotes || '') + newNote;
+  this.adminNotes = (this.adminNotes || "") + newNote;
   this.updatedBy = adminEmail;
 };
 
@@ -617,7 +619,7 @@ WalletTransactionSchema.statics.getUserTransferHistory = function (
 // 🆕 New static methods for admin features
 WalletTransactionSchema.statics.findTransactionsWithDisputes = function () {
   return this.find({
-    status: { $in: ['frozen', 'disputed'] }
+    status: { $in: ["frozen", "disputed"] },
   }).sort({ disputedAt: -1 });
 };
 
@@ -625,7 +627,7 @@ WalletTransactionSchema.statics.findRefundedTransactions = function (
   startDate?: Date,
   endDate?: Date
 ) {
-  const match: any = { status: 'refunded' };
+  const match: any = { status: "refunded" };
   if (startDate && endDate) {
     match.refundedAt = { $gte: startDate, $lte: endDate };
   }

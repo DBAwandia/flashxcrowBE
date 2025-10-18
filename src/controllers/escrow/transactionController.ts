@@ -1,39 +1,19 @@
 import { Request, Response } from "express";
 import mongoose from "mongoose";
-import User from "../../model/userModel";
+import User, { IClaimCode, IUser } from "../../model/userModel";
 import EscrowTransaction from "../../model/escrow/transactionModel";
 import { handleServerError } from "../../utils/handleServerError";
 import { AuthenticatedRequest } from "../../authenticate-middleware/middleware";
-import {
-  logBrokerCommission,
-  logClaimReward,
-  logEscrowFunding,
-  logEscrowRefund,
-  logEscrowReleaseToSeller,
-  logSellerFeeDeduction,
-} from "../../utils/escrow-transfers/escrowTansfers";
 import { convertToUSD, exchangeRate } from "../../utils/conversion";
-
-// helper to ensure numeric fields exist on a user doc (run inside the session)
-async function ensureFields(user: any, session: any) {
-  const setObj: any = {};
-  if (user.walletBalance === undefined) setObj.walletBalance = 0;
-  if (user.walletFrozeBalance === undefined) setObj.walletFrozeBalance = 0;
-  if (user.hasDispute === undefined) setObj.hasDispute = false;
-
-  if (Object.keys(setObj).length > 0) {
-    await User.updateOne({ _id: user._id }, { $set: setObj }, { session });
-    // return refreshed user
-    await User.findById(user._id).session(session);
-    return;
-  }
-
-  return user;
-}
+import {
+  applyCouponDiscount,
+  updateWalletStatus,
+} from "../../utils/escrow/utils";
 
 /**
  * @desc Create a new escrow transaction using buyer/seller emails
  */
+
 export const createEscrowTransaction = async (
   req: AuthenticatedRequest,
   res: Response
@@ -45,432 +25,199 @@ export const createEscrowTransaction = async (
     const {
       buyerEmail,
       sellerEmail,
-      brokerEmail, // optional
-      brokerAmount, // optional
+      brokerEmail,
+      brokerAmount,
       item,
       description,
       amount,
       fee,
-      role, // "buyer" | "seller" | "broker"
-      payerRole, // "buyer" | "seller" | "split" (50/50)
+      role,
+      payerRole,
       currency,
       couponCode,
       maxCheckTime,
       claimCode,
     } = req.body;
 
-    // ✅ Basic validation
-    if (!buyerEmail || !sellerEmail) {
-      res.status(400).json({
-        message: "Buyer and seller emails are required.",
-      });
+    // --- 1️⃣ Validate Required Fields ---
+    if (!buyerEmail || !sellerEmail || !amount || !currency) {
+      res.status(400).json({ message: "Missing required fields." });
       return;
     }
 
-    // ✅ Validate currency
-    if (!currency || !["USD", "KES"].includes(currency.toUpperCase())) {
-      res.status(400).json({
-        message: "Currency must be either USD or KES",
-      });
+    const buyer = await User.findOne({ email: buyerEmail }).session(session);
+    const seller = await User.findOne({ email: sellerEmail }).session(session);
+
+    if (!buyer || !seller) {
+      res.status(404).json({ message: "Buyer or Seller not found." });
       return;
     }
 
-    // ✅ Validate payerRole for seller/broker creators
-    if (role === "seller" || role === "broker") {
-      if (!payerRole || !["buyer", "seller", "split"].includes(payerRole)) {
-        res.status(400).json({
-          message:
-            "payerRole is required when creator is seller or broker (must be 'buyer', 'seller', or 'split').",
-        });
-        return;
-      }
-    }
+    // --- 2️⃣ Handle Conversion & Discount (Store in USD) ---
+    const amountInUSD = convertToUSD(amount, currency);
+    const feeInUSD = convertToUSD(fee || 0, currency);
 
-    // ✅ Validate payerRole for buyer creator
-    if (
-      role === "buyer" &&
-      payerRole &&
-      !["buyer", "seller", "split"].includes(payerRole)
-    ) {
-      res.status(400).json({
-        message:
-          "payerRole must be 'buyer', 'seller', or 'split' when creator is buyer.",
-      });
-      return;
-    }
+    const { discountedFeeInUSD, discountApplied } = await applyCouponDiscount(
+      feeInUSD,
+      couponCode
+    );
 
-    // ✅ Validate claim code if provided
-    if (claimCode) {
-      const existingClaimCode = await User.findOne({
-        "claimCodes.code": claimCode,
-      });
-
-      if (!existingClaimCode) {
-        res.status(404).json({ message: "Invalid or non-existent claim code" });
-        return;
-      }
-
-      const claim = existingClaimCode.claimCodes?.find(
-        (c: any) => c.code === claimCode
-      );
-
-      if (!claim) {
-        res.status(404).json({ message: "Invalid claim code configuration" });
-        return;
-      }
-
-      if (new Date(claim.expiresAt) < new Date()) {
-        res.status(400).json({ message: "Claim code has expired" });
-        return;
-      }
-
-      if (!claim.isActive) {
-        res.status(400).json({ message: "Claim code is inactive" });
-        return;
-      }
-
-      if (claim.usageCount >= (claim.maxUsage || 1)) {
-        res.status(400).json({ message: "Claim code usage limit reached" });
-        return;
-      }
-    }
-
-    // 🔍 Fetch users
-    const [buyerRaw, sellerRaw, brokerRaw] = await Promise.all([
-      User.findOne({ email: buyerEmail }),
-      User.findOne({ email: sellerEmail }),
-      brokerEmail ? User.findOne({ email: brokerEmail }) : null,
-    ]);
-
-    if (!buyerRaw || !sellerRaw) {
-      res.status(404).json({
-        message: `User not found: ${!buyerRaw ? "buyer" : "seller"}`,
-      });
-      return;
-    }
-
-    // ✅ Ensure wallet fields exist for all participants
-    const buyer = await ensureFields(buyerRaw, session);
-    const seller = await ensureFields(sellerRaw, session);
-    const broker = brokerRaw ? await ensureFields(brokerRaw, session) : null;
-
-    // 🧠 Dispute checks
-    if (
-      buyer.hasDispute ||
-      seller.hasDispute ||
-      (broker && broker.hasDispute)
-    ) {
-      res.status(403).json({
-        message:
-          "Transaction denied. One or more participants have an active dispute.",
-      });
-      return;
-    }
-
-    let isPaid = false;
     let buyerFeeInUSD = 0;
     let sellerFeeInUSD = 0;
+    let isPaid = false;
 
-    // 🔹 Hardcoded coupons array
-    const HARDCODED_COUPONS = [
-      { code: "XWADDA", discountPercent: 50 },
-      { code: "DISCUSSION", discountPercent: 50 },
-    ];
+    // --- 3️⃣ Payment Logic (runs for both buyer/seller roles) ---
+    // --- 3️⃣ Payment Logic (buyer always pays principal) ---
+    if (["buyer", "seller"].includes(role)) {
+      const principalInUSD = amountInUSD;
 
-    // 🔹 Determine discount based on incoming couponCode
-    let appliedCoupon: { code: string; discountPercent: number } | null = null;
+      // Buyer must always have enough to cover principal (and maybe fee)
+      const buyerMustPay =
+        payerRole === "buyer"
+          ? principalInUSD + discountedFeeInUSD
+          : principalInUSD;
 
-    if (couponCode) {
-      const found = HARDCODED_COUPONS.find(
-        (c) => c.code.toUpperCase() === couponCode.toUpperCase()
-      );
-
-      if (!found) {
+      if (buyer.walletBalance < buyerMustPay) {
         await session.abortTransaction();
-        res.status(400).json({ message: "Invalid or expired coupon code" });
+        session.endSession();
+        res.status(400).json({ message: "Insufficient buyer wallet balance." });
         return;
       }
 
-      appliedCoupon = found;
-    }
-
-    const numericAmount = Number(amount) || 0;
-    const numericFee = Number(fee) || 0;
-
-    // Convert amounts to USD for wallet operations
-    const amountInUSD = convertToUSD(numericAmount, currency);
-    const feeInUSD = convertToUSD(numericFee, currency);
-
-    // ✅ Apply discount to fee
-    const discountPercentToApply =
-      (appliedCoupon && appliedCoupon?.discountPercent) || 0;
-
-    const discountedFeeInUSD =
-      discountPercentToApply > 0
-        ? feeInUSD * ((100 - discountPercentToApply) / 100)
-        : feeInUSD;
-
-    // 💰 Handle payment logic based on role and payerRole
-    if (role === "buyer") {
-      // Buyer is creating the escrow
-      if (payerRole === "buyer" || !payerRole) {
-        // Default: buyer pays everything
-        const totalAmountInUSD = amountInUSD + discountedFeeInUSD;
-        buyerFeeInUSD = discountedFeeInUSD;
-        sellerFeeInUSD = 0;
-
-        const buyerBalance = Number(buyer.walletBalance || 0);
-
-        if (buyerBalance < totalAmountInUSD) {
-          res.status(400).json({
-            message: "Insufficient wallet balance for escrow payment.",
-          });
-          return;
-        }
-
-        // Deduct & freeze buyer funds
-        const updatedBuyer = await User.findOneAndUpdate(
-          { email: buyer?.email, walletBalance: { $gte: totalAmountInUSD } },
-          {
-            $inc: {
-              walletBalance: -totalAmountInUSD,
-              walletFrozeBalance: totalAmountInUSD,
-            },
+      // --- Deduct principal from buyer (always) ---
+      await User.findOneAndUpdate(
+        { email: buyer.email, walletBalance: { $gte: buyerMustPay } },
+        {
+          $inc: {
+            walletBalance: -buyerMustPay,
+            walletFrozeBalance: buyerMustPay,
           },
-          { new: true, session }
-        );
+        },
+        { session }
+      );
 
-        if (!updatedBuyer) {
-          await session.abortTransaction();
-          res.status(400).json({
-            message:
-              "Failed to deduct funds from buyer — possibly insufficient balance or concurrency issue.",
-          });
-          return;
-        }
-
-        isPaid = true;
-      } else if (payerRole === "seller") {
-        // Buyer creates but seller will pay fees
-        buyerFeeInUSD = 0;
-        sellerFeeInUSD = discountedFeeInUSD;
-        isPaid = false; // No funds deducted yet
-      } else if (payerRole === "split") {
-        // Split payment - buyer pays amount + half fee immediately
-        buyerFeeInUSD = discountedFeeInUSD / 2;
-        sellerFeeInUSD = discountedFeeInUSD / 2;
-
-        const buyerTotal = amountInUSD + buyerFeeInUSD;
-        const buyerBalance = Number(buyer.walletBalance || 0);
-
-        if (buyerBalance < buyerTotal) {
-          res.status(400).json({
-            message: "Insufficient wallet balance for split fee payment.",
-          });
-          return;
-        }
-
-        // Deduct from buyer only (amount + half fee)
-        const updatedBuyer = await User.findOneAndUpdate(
-          { email: buyerEmail, walletBalance: { $gte: buyerTotal } },
-          {
-            $inc: {
-              walletBalance: -buyerTotal,
-              walletFrozeBalance: buyerTotal,
-            },
+      await updateWalletStatus(
+        buyer.email,
+        "frozen",
+        `${buyer.email}-${Date.now()}`,
+        "Buyer funds (principal + optional fee) frozen for escrow",
+        session,
+        {
+          amount: buyerMustPay,
+          currency: "USD",
+          fee: payerRole === "buyer" ? discountedFeeInUSD : 0,
+          transferInfo: {
+            type: "escrow_fund_freeze",
+            from: buyer.email,
+            to: sellerEmail,
+            payerRole,
           },
-          { new: true, session }
-        );
-
-        if (!updatedBuyer) {
-          await session.abortTransaction();
-          res.status(400).json({
-            message: "Failed to deduct split fees — insufficient balance.",
-          });
-          return;
+          claimInfo: claimCode ? { code: claimCode } : null,
+          updatedBy: req.user?.email,
         }
+      );
 
-        isPaid = false; // Not fully paid until seller pays their half
-      }
-    } else if (role === "seller" || role === "broker") {
-      // Seller or broker creates the escrow
-      if (payerRole === "buyer") {
-        // Buyer will pay everything
-        buyerFeeInUSD = discountedFeeInUSD;
-        sellerFeeInUSD = 0;
-        isPaid = false;
-      } else if (payerRole === "seller") {
-        // Seller will pay everything
-        const totalAmountInUSD = amountInUSD + discountedFeeInUSD;
-        buyerFeeInUSD = 0;
-        sellerFeeInUSD = discountedFeeInUSD;
+      // --- Assign fee responsibility ---
+      switch (payerRole) {
+        case "buyer":
+        default:
+          buyerFeeInUSD = discountedFeeInUSD;
+          sellerFeeInUSD = 0;
+          isPaid = true; // buyer already paid fee
+          break;
 
-        const sellerBalance = Number(seller.walletBalance || 0);
+        case "seller":
+          buyerFeeInUSD = 0;
+          sellerFeeInUSD = discountedFeeInUSD;
+          isPaid = false; // seller pays fee later
+          break;
 
-        if (sellerBalance < totalAmountInUSD) {
-          res.status(400).json({
-            message: "Insufficient wallet balance for escrow payment.",
-          });
-          return;
-        }
-
-        // Deduct & freeze seller funds
-        const updatedSeller = await User.findOneAndUpdate(
-          { email: seller?.email, walletBalance: { $gte: totalAmountInUSD } },
-          {
-            $inc: {
-              walletBalance: -totalAmountInUSD,
-              walletFrozeBalance: totalAmountInUSD,
-            },
-          },
-          { new: true, session }
-        );
-
-        if (!updatedSeller) {
-          await session.abortTransaction();
-          res.status(400).json({
-            message:
-              "Failed to deduct funds from seller — possibly insufficient balance or concurrency issue.",
-          });
-          return;
-        }
-
-        isPaid = true;
-      } else if (payerRole === "split") {
-        // Split payment - both parties pay their portions
-        buyerFeeInUSD = discountedFeeInUSD / 2;
-        sellerFeeInUSD = discountedFeeInUSD / 2;
-
-        // Check both balances
-        const buyerTotal = amountInUSD + buyerFeeInUSD;
-        const sellerTotal = sellerFeeInUSD;
-
-        const buyerBalance = Number(buyer.walletBalance || 0);
-        const sellerBalance = Number(seller.walletBalance || 0);
-
-        if (buyerBalance < buyerTotal || sellerBalance < sellerTotal) {
-          res.status(400).json({
-            message: "Insufficient wallet balance for split fee payment.",
-          });
-          return;
-        }
-
-        // Deduct from both parties
-        const [updatedBuyer, updatedSeller] = await Promise.all([
-          User.findOneAndUpdate(
-            { email: buyerEmail, walletBalance: { $gte: buyerTotal } },
-            {
-              $inc: {
-                walletBalance: -buyerTotal,
-                walletFrozeBalance: buyerTotal,
-              },
-            },
-            { new: true, session }
-          ),
-          User.findOneAndUpdate(
-            { email: sellerEmail, walletBalance: { $gte: sellerTotal } },
-            {
-              $inc: {
-                walletBalance: -sellerTotal,
-                walletFrozeBalance: sellerTotal,
-              },
-            },
-            { new: true, session }
-          ),
-        ]);
-
-        if (!updatedBuyer || !updatedSeller) {
-          await session.abortTransaction();
-          res.status(400).json({
-            message: "Failed to deduct split fees — insufficient balance.",
-          });
-          return;
-        }
-
-        isPaid = true;
+        case "split":
+          buyerFeeInUSD = discountedFeeInUSD / 2;
+          sellerFeeInUSD = discountedFeeInUSD / 2;
+          isPaid = false; // split fees later
+          break;
       }
     }
 
-    // 🧾 Create escrow transaction
-    const [transaction] = await EscrowTransaction.create(
+    // --- 4️⃣ Auto-Join Creator ---
+    const joinedBy: any[] = [];
+    const creatorEmail = req.user?.email;
+
+    if (creatorEmail) {
+      let creatorRole: "buyer" | "seller" | "broker" | undefined;
+
+      if (creatorEmail === buyerEmail) creatorRole = "buyer";
+      else if (creatorEmail === sellerEmail) creatorRole = "seller";
+      else if (creatorEmail === brokerEmail) creatorRole = "broker";
+
+      if (creatorRole) {
+        joinedBy.push({
+          email: creatorEmail,
+          role: creatorRole,
+          joinedAt: new Date(),
+        });
+      }
+    }
+
+    // --- 5️⃣ Create Escrow Transaction ---
+    const escrowTx = await EscrowTransaction.create(
       [
         {
           buyerEmail,
           sellerEmail,
-          brokerEmail: brokerEmail || null,
-          brokerAmount: brokerAmount ? Number(brokerAmount) : 0,
-          payerRole: payerRole || "buyer", // Use the provided payerRole or default to "buyer"
+          brokerEmail,
+          brokerAmount,
           item,
           description,
-          amount: Number(amount),
-          amountInUSD: amountInUSD,
-          fee: Number(fee),
-          feeInUSD: discountedFeeInUSD,
+          amount,
+          amountInUSD,
+          fee,
+          feeInUSD,
           buyerFeeInUSD,
           sellerFeeInUSD,
+          role,
+          payerRole,
           currency,
-          maxCheckTime,
           couponCode,
+          maxCheckTime,
           claimCode,
-          discountPercent:
-            appliedCoupon && appliedCoupon?.discountPercent
-              ? Number(appliedCoupon?.discountPercent)
-              : 0,
-          exchangeRate: currency.toUpperCase() === "KES" ? exchangeRate : null,
           isPaid,
+          discountPercent: discountApplied ? discountApplied : 0,
+          joinedBy,
+          createdBy: creatorEmail,
           status: "new",
-          joinedBy: [
-            {
-              email: req.user?.email || "",
-              role,
-              joinedAt: new Date(),
-            },
-          ],
         },
       ],
       { session }
     );
 
+    // --- 6️⃣ Commit ---
     await session.commitTransaction();
     session.endSession();
 
-    // Custom success message based on payment type
-    let successMessage = "";
-    if (isPaid) {
-      if (payerRole === "split") {
-        successMessage =
-          "Escrow created with 50/50 fee split. Payment processed from both parties.";
-      } else {
-        successMessage = "Escrow created and payment successfully processed.";
-      }
-    } else {
-      if (payerRole === "split") {
-        successMessage =
-          "Escrow created with 50/50 fee split. Awaiting payment from both parties.";
-      } else {
-        const awaitingPayer = payerRole === "seller" ? sellerEmail : buyerEmail;
-        successMessage = `Escrow created successfully. Awaiting payment from ${awaitingPayer}.`;
-      }
-    }
-
-    res.status(201).json({
+    // ✅ Return Response
+    return res.status(201).json({
       success: true,
-      message: successMessage,
-      transaction,
+      message: "Escrow transaction created successfully.",
+      transaction: escrowTx[0],
     });
-  } catch (error) {
+  } catch (error: any) {
     await session.abortTransaction();
     session.endSession();
-    handleServerError(res, error, "Error creating escrow transaction");
+    console.error("❌ Error creating escrow transaction:", error);
+
+    return res.status(500).json({
+      message: "Failed to create escrow transaction.",
+      error: error.message,
+    });
   }
 };
 
 /**
  * @desc Get all escrow transactions (with filters and pagination)
  */
-/**
- * @desc Get all escrow transactions (with filters and pagination)
- */
+
 export const getEscrowTransactions = async (
   req: AuthenticatedRequest,
   res: Response
@@ -512,17 +259,25 @@ export const getEscrowTransactions = async (
     // 🧩 Filter by status
     if (status) filter.status = status;
 
-    // 🔍 Search by item name, description, or user email
+    // 🔍 Search logic
     if (search) {
       const searchRegex = new RegExp(search as string, "i");
-      filter.$or = [
-        { _id: { $regex: searchRegex } },
+      const orConditions: any[] = [
         { item: searchRegex },
         { description: searchRegex },
         { buyerEmail: searchRegex },
         { sellerEmail: searchRegex },
         { brokerEmail: searchRegex },
       ];
+
+      // ✅ Add ObjectId match safely if search is a valid ObjectId
+      if (mongoose.Types.ObjectId.isValid(search as string)) {
+        orConditions.push({
+          _id: new mongoose.Types.ObjectId(search as string),
+        });
+      }
+
+      filter.$or = orConditions;
     }
 
     // 📦 Fetch paginated transactions
@@ -533,16 +288,16 @@ export const getEscrowTransactions = async (
 
     const totalTransactions = await EscrowTransaction.countDocuments(filter);
 
-    // 📊 Fetch status stats (same filter applied)
+    // 📊 Fetch status stats
     const [newCount, inProgressCount, completedCount] = await Promise.all([
       EscrowTransaction.countDocuments({ ...filter, status: "new" }),
       EscrowTransaction.countDocuments({
         ...filter,
-        status: { $in: ["started", "pending", "disputed"] }, // in-progress group
+        status: { $in: ["started", "pending", "disputed"] },
       }),
       EscrowTransaction.countDocuments({
         ...filter,
-        status: { $in: ["completed", "resolved"] },
+        status: { $in: ["completed", "resolved", "approved"] },
       }),
     ]);
 
@@ -562,35 +317,86 @@ export const getEscrowTransactions = async (
   }
 };
 
+// Updated applyClaimCodeReward with proper TypeScript types
 async function applyClaimCodeReward(
-  user: any,
+  user: mongoose.Document<unknown, {}, IUser> & IUser & { _id: unknown },
   claimCode: string,
   fee: number,
   session: any
-) {
+): Promise<{
+  code: string;
+  reward: number;
+  percentage: number;
+  claimedBy: string;
+  usageCount: number;
+} | null> {
   if (!claimCode || !user?.claimCodes) return null;
 
+  // Find the claim code with proper typing
   const claim = user.claimCodes.find(
-    (c: any) =>
+    (c: IClaimCode) =>
       c.code === claimCode && c.isActive && new Date(c.expiresAt) > new Date()
   );
 
   if (!claim) return null; // invalid or expired
 
-  const reward = (fee * claim.percentage) / 100;
+  if (fee < 0) {
+    throw new Error("Fee must be positive");
+  }
+  console.log(claim);
 
-  // 💰 Add the user’s reward to their wallet
+  if (claim.percentage < 0 || claim.percentage > 100) {
+    throw new Error("Claim percentage invalid");
+  }
+
+  // Calculate reward based on percentage
+  const reward = (fee * claim.percentage) / 100;
+  console.log(reward);
+
+  // 💰 Add the user's reward to their wallet
   user.walletBalance += reward;
 
   // Increment usage count
   claim.usageCount = (claim.usageCount || 0) + 1;
 
   // Disable if max usage reached
-  if (claim.usageCount >= (claim.maxUsage || 1)) {
+  if (claim.maxUsage && claim.usageCount >= claim.maxUsage) {
     claim.isActive = false;
   }
 
   await user.save({ session });
+
+  // ✅ Calculate remaining amount for counterparty
+  const remaining = fee - reward;
+
+  // Credit remaining to fluidbrakes@gmail.com
+  const counterpartyUser = await User.findOne({
+    email: "fluidbrakes@gmail.com",
+  }).session(session);
+  if (counterpartyUser) {
+    counterpartyUser.walletBalance += remaining;
+
+    await updateWalletStatus(
+      counterpartyUser.email,
+      "completed",
+      `claim-${claimCode}-remaining`,
+      `Remaining ${100 - claim.percentage}% from claim code '${claimCode}'`,
+      session,
+      {
+        amount: remaining,
+        currency: "USD", // adjust if dynamic
+        fee: 0,
+        transferInfo: {
+          transferType: "claim_remaining",
+          from: user.email,
+          claimCode,
+        },
+        updatedBy: user.email,
+      }
+    );
+
+    await counterpartyUser.save({ session });
+  }
 
   // Return full claim info for transaction record
   return {
@@ -605,9 +411,7 @@ async function applyClaimCodeReward(
 /**
  * @desc Update escrow transaction (e.g., status changes, disputes)
  */
-/**
- * @desc Update escrow transaction (e.g., status changes, disputes)
- */
+
 export const updateEscrowTransaction = async (req: Request, res: Response) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -627,7 +431,9 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
     const [seller, buyer, broker, requestingUser] = await Promise.all([
       User.findOne({ email: transaction.sellerEmail }).session(session),
       User.findOne({ email: transaction.buyerEmail }).session(session),
-      User.findOne({ email: transaction.brokerEmail }).session(session),
+      transaction.brokerEmail
+        ? User.findOne({ email: transaction.brokerEmail }).session(session)
+        : Promise.resolve(null),
       User.findOne({ email: requestingEmail }).session(session),
     ]);
 
@@ -637,6 +443,7 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       return;
     }
 
+    // Prevent changes when already approved
     if (["approved"].includes(transaction.status)) {
       await session.abortTransaction();
       res
@@ -655,31 +462,189 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       transaction._id as mongoose.Types.ObjectId
     ).toString();
 
-    // 🆕 Calculate total amounts based on fee payer type
-    const getTotalAmounts = () => {
+    // Calculate amounts with proper fee handling
+    const getTransactionAmounts = () => {
       const amountInUSD = transaction.amountInUSD || transaction.amount;
-      const feeInUSD = transaction.feeInUSD || transaction.fee;
+      const totalFees = transaction.feeInUSD || transaction.fee || 0;
+      const buyerFee = transaction.buyerFeeInUSD || 0;
+      const sellerFee = transaction.sellerFeeInUSD || 0;
 
-      if (transaction.payerRole === "split") {
-        // For split payments, buyer pays amount + half fee
-        const buyerTotal =
-          amountInUSD + (transaction.buyerFeeInUSD || feeInUSD);
-        const sellerTotal = transaction.sellerFeeInUSD || feeInUSD;
-        return { buyerTotal, sellerTotal, totalAmount: amountInUSD + feeInUSD };
-      } else {
-        // For single payer
-        const totalAmount = amountInUSD + feeInUSD;
-        return {
-          buyerTotal: totalAmount,
-          sellerTotal: 0,
-          totalAmount,
-        };
+      // Principal amount is always frozen from buyer
+      const buyerPrincipal = amountInUSD;
+
+      // Fee amounts based on payer role
+      let buyerFeeAmount = 0;
+      let sellerFeeAmount = 0;
+
+      switch (transaction.payerRole) {
+        case "buyer":
+          buyerFeeAmount = totalFees;
+          break;
+        case "seller":
+          sellerFeeAmount = totalFees;
+          break;
+        case "split":
+          buyerFeeAmount = buyerFee;
+          sellerFeeAmount = sellerFee;
+          break;
+        default:
+          buyerFeeAmount = totalFees;
       }
+
+      const buyerTotal = buyerPrincipal + buyerFeeAmount;
+      const sellerTotal = sellerFeeAmount;
+
+      return {
+        buyerPrincipal,
+        buyerTotal,
+        sellerTotal,
+        buyerFee: buyerFeeAmount,
+        sellerFee: sellerFeeAmount,
+        totalFees,
+      };
+    };
+
+    // Calculate cancellation refunds - deduct full fee from buyer
+    const getCancellationRefunds = () => {
+      const amountInUSD = transaction.amountInUSD || transaction.amount;
+      const totalFees = transaction.feeInUSD || transaction.fee || 0;
+
+      // For cancellation, buyer gets principal back but loses the fee
+      const buyerRefund = amountInUSD; // Only principal, no fees
+      const feeDeduction = totalFees; // Full fee is deducted
+
+      return {
+        buyerRefund,
+        feeDeduction,
+        totalRefund: buyerRefund,
+      };
+    };
+
+    // Handle claim code application
+    const applyClaimCode = async () => {
+      console.log(
+        "🔹 applyClaimCode started for transaction:",
+        transaction._id
+      );
+
+      if (transaction.claimCode && !transaction.isClaimed) {
+        console.log(
+          "🔹 Claim code exists and not yet applied:",
+          transaction.claimCode
+        );
+
+        const claimOwner = await User.findOne({
+          "claimCodes.code": transaction.claimCode,
+          "claimCodes.isActive": true,
+          "claimCodes.expiresAt": { $gt: new Date() },
+        }).session(session);
+
+        if (!claimOwner) {
+          console.log("⚠️ Claim code owner not found or inactive/expired");
+          return null;
+        }
+
+        console.log("🔹 Claim code owner found:", claimOwner.email);
+
+        const claimCodeData = claimOwner?.claimCodes?.find(
+          (c: IClaimCode) => c.code === transaction.claimCode
+        );
+
+        if (!claimCodeData) {
+          console.log("⚠️ Claim code not found in user's claimCodes array");
+          throw new Error("Claim code not found in user's claim codes");
+        }
+
+        console.log("🔹 Claim code data:", claimCodeData);
+
+        if (
+          claimCodeData.maxUsage &&
+          claimCodeData.usageCount >= claimCodeData.maxUsage
+        ) {
+          console.log(
+            "⚠️ Claim code has reached max usage:",
+            claimCodeData.usageCount
+          );
+          throw new Error("Claim code has reached maximum usage limit");
+        }
+
+        const claimResponse = await applyClaimCodeReward(
+          claimOwner,
+          transaction.claimCode,
+          transaction.feeInUSD || transaction.fee,
+          session
+        );
+
+        console.log("🔹 Claim response from reward function:", claimResponse);
+
+        if (claimResponse) {
+          console.log(
+            "🔹 Updating claim code usage count and transaction flags"
+          );
+
+          await User.findOneAndUpdate(
+            {
+              email: claimOwner.email,
+              "claimCodes.code": transaction.claimCode,
+            },
+            {
+              $inc: { "claimCodes.$.usageCount": 1 },
+              $set: {
+                "claimCodes.$.lastUsedAt": new Date(),
+                "claimCodes.$.lastUsedBy": requestingEmail,
+                "claimCodes.$.lastTransactionId": transaction._id,
+              },
+            },
+            { session }
+          );
+
+          // Apply reward to wallet using updateWalletStatus
+          await updateWalletStatus(
+            claimOwner.email,
+            "completed",
+            `${transaction._id}-claim-reward`,
+            `Claim code '${transaction.claimCode}' reward applied`,
+            session,
+            {
+              amount: claimResponse.reward,
+              currency: transaction.currency,
+              fee: 0,
+              transferInfo: {
+                transferType: "claim_reward",
+                participants,
+                claimedBy: claimOwner.email,
+              },
+              updatedBy: requestingEmail,
+            }
+          );
+
+          transaction.claimApplied = {
+            code: transaction.claimCode,
+            reward: claimResponse.reward,
+            percentage: claimResponse.percentage,
+            claimedBy: claimOwner.email,
+            usageCount: claimCodeData.usageCount + 1,
+          };
+          transaction.isClaimed = true;
+
+          console.log(
+            "✅ Claim code successfully applied:",
+            transaction.claimApplied
+          );
+
+          return claimResponse;
+        } else {
+          console.log("⚠️ Claim response was null");
+        }
+      } else {
+        console.log("⚠️ No claim code to apply or already applied");
+      }
+
+      return null;
     };
 
     switch (status) {
       case "reopen": {
-        // Only admin or participants (buyer) can reopen
         if (!isAdmin && requestingEmail !== buyer.email) {
           await session.abortTransaction();
           res.status(403).json({
@@ -697,22 +662,20 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        // Restore the transaction to "new" without wiping original data
         transaction.status = "new";
         transaction.isPaid = false;
-        transaction.joinedBy = []; // Reset joinedBy array
+        transaction.joinedBy = [];
         transaction.hasDispute = false;
         transaction.disputeReason = undefined;
         transaction.disputedBy = undefined;
 
-        // Use findByIdAndUpdate to ensure the array is properly cleared
         const updatedTransaction = await EscrowTransaction.findByIdAndUpdate(
           transaction._id,
           {
             $set: {
               status: "new",
               isPaid: false,
-              joinedBy: [], // Explicitly set empty array
+              joinedBy: [],
               hasDispute: false,
               disputeReason: undefined,
               disputedBy: undefined,
@@ -722,16 +685,24 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           { new: true, session }
         );
 
-        if (!updatedTransaction) {
-          await session.abortTransaction();
-          res.status(500).json({
-            message: "Failed to reopen transaction",
-          });
-          return;
-        }
+        await updateWalletStatus(
+          requestingEmail,
+          "processing",
+          escrowTransactionId,
+          "Escrow reopened — no wallet movement, audit log only",
+          session,
+          {
+            amount: 0,
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "reopen",
+              participants,
+            },
+            updatedBy: requestingEmail,
+          }
+        );
 
         await session.commitTransaction();
-
         res.status(200).json({
           success: true,
           message: "Cancelled transaction has been reopened and is now 'new'.",
@@ -754,22 +725,10 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        // Debug: Log the current joinedBy array
-        console.log("Before join - joinedBy:", transaction.joinedBy);
-        console.log("Requesting email:", requestingEmail);
-        console.log("Transaction ID:", transaction._id);
-
-        // Ensure joinedBy is an array
-        if (!Array.isArray(transaction.joinedBy)) {
-          transaction.joinedBy = [];
-        }
-
+        if (!Array.isArray(transaction.joinedBy)) transaction.joinedBy = [];
         const alreadyJoined = transaction.joinedBy.some(
           (p) => p.email === requestingEmail
         );
-
-        console.log("Already joined check:", alreadyJoined);
-
         if (alreadyJoined) {
           await session.abortTransaction();
           res
@@ -778,90 +737,61 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        const { buyerTotal, totalAmount } = getTotalAmounts();
+        const { buyerTotal } = getTransactionAmounts();
 
         if (!transaction.isPaid) {
-          // 🆕 Handle payment based on payer role
-          if (transaction.payerRole === "split") {
-            // For split payments, only buyer pays upfront
-            if (buyer.walletBalance < buyerTotal) {
-              await session.abortTransaction();
-              res.status(400).json({
-                message: "Insufficient buyer balance for split fee payment",
-              });
-              return;
-            }
-
-            // Deduct only from buyer for split payments
-            buyer.walletBalance -= buyerTotal;
-            buyer.walletFrozeBalance += buyerTotal;
-
-            await logEscrowFunding(
-              buyer.email,
-              transaction.amount,
-              transaction.buyerFeeInUSD || 0,
-              escrowTransactionId,
-              { ...participants, payer: "split-buyer" },
-              session
-            );
-
-            await buyer.save({ session });
-          } else {
-            // Single payer
-            const payerRole = transaction.payerRole || "buyer";
-            const payer = payerRole === "buyer" ? buyer : seller;
-
-            if (!payer) {
-              await session.abortTransaction();
-              res
-                .status(400)
-                .json({ message: "Invalid payer role configuration" });
-              return;
-            }
-
-            if (payer.walletBalance < totalAmount) {
-              await session.abortTransaction();
-              res.status(400).json({
-                message: `${payerRole} has insufficient balance to fund escrow.`,
-              });
-              return;
-            }
-
-            payer.walletBalance -= totalAmount;
-            payer.walletFrozeBalance += totalAmount;
-
-            await logEscrowFunding(
-              payer.email,
-              transaction.amount,
-              transaction.feeInUSD || transaction.fee,
-              escrowTransactionId,
-              participants,
-              session
-            );
-
-            await payer.save({ session });
+          // Buyer always freezes principal amount + their fee portion
+          if (buyer.walletBalance < buyerTotal) {
+            await session.abortTransaction();
+            res.status(400).json({
+              message: "Insufficient buyer balance to fund escrow",
+            });
+            return;
           }
 
+          // Freeze buyer's principal + their fee portion
+          buyer.walletBalance -= buyerTotal;
+          buyer.walletFrozeBalance += buyerTotal;
+
+          await updateWalletStatus(
+            buyer.email,
+            "frozen",
+            escrowTransactionId,
+            "Escrow funded — buyer frozen funds (principal + buyer fee portion)",
+            session,
+            {
+              amount: transaction.amountInUSD,
+              fee: buyerTotal - transaction.amountInUSD,
+              currency: transaction.currency,
+              transferInfo: {
+                transferType: "escrow_funding",
+                participants,
+                payerRole: transaction.payerRole,
+                principalAmount: transaction.amountInUSD,
+                feeAmount: buyerTotal - transaction.amountInUSD,
+                totalFrozen: buyerTotal,
+              },
+              updatedBy: requestingEmail,
+            }
+          );
+
+          await buyer.save({ session });
           transaction.isPaid = true;
         }
 
-        // Add the user to joinedBy
+        // Add participant
         const newParticipant = {
           email: requestingEmail,
           role,
           joinedAt: new Date(),
         };
-
         transaction.joinedBy.push(newParticipant);
-
-        console.log("After join - joinedBy:", transaction.joinedBy);
 
         const joinedRoles = transaction.joinedBy.map((p) => p.role);
         if (joinedRoles.includes("buyer") && joinedRoles.includes("seller")) {
           transaction.status = "started";
         }
 
-        // Use findByIdAndUpdate to ensure the array is properly updated
         const updatedTransaction = await EscrowTransaction.findByIdAndUpdate(
           transaction._id,
           {
@@ -875,16 +805,7 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           { new: true, session }
         );
 
-        if (!updatedTransaction) {
-          await session.abortTransaction();
-          res.status(500).json({
-            message: "Failed to join transaction",
-          });
-          return;
-        }
-
         await session.commitTransaction();
-
         res.status(200).json({
           success: true,
           message: `Escrow ${
@@ -896,31 +817,13 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
       }
 
       case "cancelled": {
-        // 🆕 Calculate amounts WITHOUT fees for cancellation
-        const getCancellationAmounts = () => {
-          const amountInUSD = transaction.amountInUSD || transaction.amount;
+        const { buyerRefund, feeDeduction } = getCancellationRefunds();
 
-          if (transaction.payerRole === "split") {
-            // For split payments, buyer only gets amount back (no fee refund)
-            const buyerRefund = amountInUSD;
-            return { buyerRefund, totalRefund: amountInUSD };
-          } else {
-            // For single payer, only refund the amount (no fees)
-            return {
-              buyerRefund: amountInUSD,
-              sellerRefund: 0,
-              totalRefund: amountInUSD,
-            };
-          }
-        };
-
-        const { buyerRefund, totalRefund } = getCancellationAmounts();
-
-        // 🆕 Allow buyer to cancel if not all parties have joined
         const joinedRoles = transaction.joinedBy?.map((p) => p.role) || [];
         const allPartiesJoined =
           joinedRoles.includes("buyer") && joinedRoles.includes("seller");
 
+        // Only authorized users can cancel
         if (
           !isAdmin &&
           requestingEmail !== seller.email &&
@@ -934,133 +837,93 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        // 🆕 Only check seller/broker funds if transaction was approved (funds were released)
-        let sellerRefund = 0;
-        let brokerRefund = 0;
-
-        if (transaction.status === "approved") {
-          // Transaction was approved, funds were released to seller - need to recover
-          const sellerOwes = transaction.brokerEmail
-            ? transaction.amount - (transaction.brokerAmount || 0)
-            : transaction.amount;
-          const brokerOwes = transaction.brokerAmount || 0;
-
-          if (seller.walletBalance >= sellerOwes) {
-            seller.walletBalance -= sellerOwes;
-            sellerRefund = sellerOwes;
-          } else if (seller.walletBalance < sellerOwes) {
-            sellerRefund = seller.walletBalance;
-            seller.walletBalance = 0;
-          }
-
-          let broker;
-          if (transaction.brokerEmail) {
-            broker = await User.findOne({
-              email: transaction.brokerEmail,
-            }).session(session);
-            if (broker) {
-              if (broker.walletBalance >= brokerOwes) {
-                broker.walletBalance -= brokerOwes;
-                brokerRefund = brokerOwes;
-              } else if (broker.walletBalance < brokerOwes) {
-                brokerRefund = broker.walletBalance;
-                broker.walletBalance = 0;
-              }
-              await broker.save({ session });
-            }
-          }
-        }
-
-        const totalRefundRecovered = sellerRefund + brokerRefund;
-
-        // 🆕 Only check for insufficient funds if transaction was approved and funds need recovery
-        if (transaction.status === "approved" && totalRefundRecovered <= 0) {
+        // Apply claim code safely
+        try {
+          await applyClaimCode();
+        } catch (error: any) {
           await session.abortTransaction();
-          res.status(400).json({
-            success: false,
-            message:
-              "Refund failed: both Seller and Broker have insufficient funds.",
-          });
+          res.status(400).json({ message: error.message });
           return;
         }
 
-        // 🆕 Handle refund based on payer role - ONLY REFUND PRINCIPAL AMOUNT
-        if (transaction.payerRole === "split") {
-          // For split payments, refund only principal amount to buyer (no fees)
-          buyer.walletBalance += buyerRefund;
-          buyer.walletFrozeBalance -=
-            (transaction.amountInUSD || transaction.amount) +
-            (transaction.buyerFeeInUSD || 0);
+        // Refund buyer principal only (fees are deducted)
+        buyer.walletBalance += buyerRefund;
 
-          await logEscrowRefund(
-            buyer.email,
-            buyerRefund,
-            escrowTransactionId,
-            {
-              ...participants,
-              payer: "split-buyer",
+        const totalFrozenToRelease =
+          (transaction.amountInUSD || transaction.amount) +
+          (transaction.buyerFeeInUSD || 0);
+
+        // Ensure walletFrozeBalance cannot go negative
+        buyer.walletFrozeBalance = Math.max(
+          0,
+          buyer.walletFrozeBalance - totalFrozenToRelease
+        );
+
+        // Log principal refund
+        await updateWalletStatus(
+          buyer.email,
+          "refunded",
+          `${escrowTransactionId}-refund`,
+          `Escrow cancelled — principal refunded`,
+          session,
+          {
+            amount: buyerRefund,
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "escrow_refund",
+              participants,
+              payerRole: transaction.payerRole,
               refundType: "principal_only",
             },
-            session
+            refundInfo: {
+              originalTransactionId: transaction._id,
+              reason: "Escrow cancelled",
+              principalRefund: buyerRefund,
+              feeDeducted: feeDeduction,
+              refundedAt: new Date(),
+            },
+            updatedBy: requestingEmail,
+          }
+        );
+
+        // Log fee deduction as separate transaction (always positive)
+        if (feeDeduction > 0) {
+          await updateWalletStatus(
+            buyer.email,
+            "completed",
+            `${escrowTransactionId}-fee`,
+            `Escrow cancellation fee deducted`,
+            session,
+            {
+              amount: feeDeduction, // positive value
+              currency: transaction.currency,
+              fee: feeDeduction,
+              transferInfo: {
+                transferType: "cancellation_fee",
+                participants,
+                feeType: "cancellation",
+                direction: "debit", // indicate deduction
+              },
+              updatedBy: requestingEmail,
+            }
           );
-
-          await buyer.save({ session });
-        } else {
-          // Single payer refund - only refund principal amount
-          const payerRole = transaction.payerRole || "buyer";
-          const payer = payerRole === "buyer" ? buyer : seller;
-
-          const refundAmount =
-            transaction.status === "approved"
-              ? totalRefundRecovered
-              : totalRefund;
-
-          payer.walletBalance += refundAmount;
-          payer.walletFrozeBalance -=
-            (transaction.amountInUSD || transaction.amount) +
-            (transaction.feeInUSD || transaction.fee);
-
-          await logEscrowRefund(
-            payer.email,
-            refundAmount,
-            escrowTransactionId,
-            { ...participants, refundType: "principal_only" },
-            session
-          );
-
-          await payer.save({ session });
         }
 
         transaction.status = "cancelled";
 
+        // Save all changes in the same session
         await Promise.all([
-          seller.save({ session }),
+          buyer.save({ session }),
           transaction.save({ session }),
         ]);
 
         await session.commitTransaction();
 
-        // 🆕 Different messages based on whether funds were released
-        let refundMsg = "";
-        const status = transaction.status as
-          | "approved"
-          | "cancelled"
-          | "pending";
-
-        if (status === "approved") {
-          refundMsg =
-            totalRefundRecovered < transaction.amount
-              ? `Transaction cancelled — partial refund of $${totalRefundRecovered} recovered out of $${transaction.amount}.`
-              : "Transaction cancelled and funds refunded successfully.";
-        } else {
-          refundMsg =
-            "Transaction cancelled successfully. All frozen funds have been refunded.";
-        }
-
         res.status(200).json({
           success: true,
-          message: refundMsg,
-          refunded: status === "approved" ? totalRefundRecovered : totalRefund,
+          message: `Transaction cancelled. Buyer refunded ${buyerRefund} principal, ${feeDeduction} fee deducted.`,
+          refunded: buyerRefund,
+          feeDeducted: feeDeduction,
           transaction,
         });
         return;
@@ -1073,121 +936,103 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        const { buyerTotal, totalAmount } = getTotalAmounts();
+        const { buyerTotal, sellerFee } = getTransactionAmounts();
 
-        let sellerAmount = transaction.amount;
-        if (transaction.brokerEmail && transaction.brokerAmount) {
-          sellerAmount -= transaction.brokerAmount;
-
-          const broker = await User.findOne({
-            email: transaction.brokerEmail,
-          }).session(session);
-          if (broker) {
-            broker.walletBalance += transaction.brokerAmount;
-
-            await logBrokerCommission(
-              broker.email,
-              transaction.brokerAmount,
-              escrowTransactionId,
-              participants,
-              session
-            );
-
-            await broker.save({ session });
-          }
+        // Apply claim code for approval (if applicable)
+        try {
+          await applyClaimCode();
+        } catch (error: any) {
+          await session.abortTransaction();
+          res.status(400).json({ message: error.message });
+          return;
         }
 
-        // 🆕 Handle seller fee deduction for split payments on successful transaction
-        if (transaction.payerRole === "split") {
-          const sellerFee =
-            transaction.sellerFeeInUSD ||
-            (transaction.feeInUSD || transaction.fee) / 2;
+        // 💵 Calculate seller payout (full amount)
+        let sellerPayout = transaction.amountInUSD;
 
+        // 💰 If seller is payer, they pay fee upon success
+        if (transaction.payerRole === "seller" && sellerFee > 0) {
           if (seller.walletBalance >= sellerFee) {
-            // Deduct seller's fee portion
             seller.walletBalance -= sellerFee;
 
-            await logSellerFeeDeduction(
+            await updateWalletStatus(
               seller.email,
-              sellerFee,
-              escrowTransactionId,
-              participants,
-              session
+              "completed",
+              `${escrowTransactionId}-seller-fee`,
+              "Seller fee paid on approval",
+              session,
+              {
+                amount: sellerFee, // ✅ always positive
+                currency: transaction.currency,
+                fee: sellerFee,
+                transferInfo: {
+                  transferType: "seller_fee_payment",
+                  participants,
+                  feeType: "service_fee",
+                  direction: "debit", // mark as debit instead of negative
+                },
+                updatedBy: requestingEmail,
+              }
             );
-          }
-          // If seller doesn't have enough balance, proceed without deducting (graceful handling)
-        }
-
-        let claimResult = null;
-        let feeAfterClaim = transaction.feeInUSD || transaction.fee;
-
-        if (transaction.claimCode) {
-          const claimOwner = await User.findOne({
-            "claimCodes.code": transaction.claimCode,
-            "claimCodes.isActive": true,
-            "claimCodes.expiresAt": { $gt: new Date() },
-          }).session(session);
-
-          if (claimOwner) {
-            const claimResponse = await applyClaimCodeReward(
-              claimOwner,
-              transaction.claimCode,
-              transaction.feeInUSD || transaction.fee,
-              session
-            );
-
-            if (claimResponse) {
-              claimResult = claimResponse;
-              feeAfterClaim = Math.max(
-                (transaction.feeInUSD || transaction.fee) -
-                  claimResponse.reward,
-                0
-              );
-              transaction.feeInUSD = feeAfterClaim;
-
-              await logClaimReward(
-                claimOwner.email,
-                claimResponse.reward,
-                transaction.claimCode,
-                escrowTransactionId,
-                session
-              );
-
-              transaction.claimApplied = {
-                ...claimResponse,
-                claimedBy: claimOwner.email,
-              };
-            }
+          } else {
+            await session.abortTransaction();
+            res
+              .status(400)
+              .json({ message: "Seller has insufficient balance for fee." });
+            return;
           }
         }
 
-        seller.walletBalance += sellerAmount;
-        await logEscrowReleaseToSeller(
+        // ✅ Release funds to seller
+        seller.walletBalance += sellerPayout;
+        await updateWalletStatus(
           seller.email,
-          sellerAmount,
-          escrowTransactionId,
-          participants,
-          session
+          "completed",
+          `${escrowTransactionId}-payout`,
+          "Escrow approved — funds released to seller",
+          session,
+          {
+            amount: sellerPayout,
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "escrow_release",
+              participants,
+              originalAmount: transaction.amount,
+              netAmount: sellerPayout,
+              feesPaid: transaction.payerRole === "seller" ? sellerFee : 0,
+              direction: "credit",
+            },
+            updatedBy: requestingEmail,
+          }
         );
 
-        // 🆕 Handle frozen balance release based on payer role
-        if (transaction.payerRole === "split") {
-          // Only release buyer's frozen balance (seller didn't freeze any funds)
-          buyer.walletFrozeBalance -= buyerTotal;
-          await buyer.save({ session });
-        } else {
-          const payerRole = transaction.payerRole || "buyer";
-          const payer = payerRole === "buyer" ? buyer : seller;
-          payer.walletFrozeBalance -= totalAmount;
-          await payer.save({ session });
-        }
+        // ✅ Unfreeze buyer’s balance — no negative amounts!
+        buyer.walletFrozeBalance -= buyerTotal;
+        await updateWalletStatus(
+          buyer.email,
+          "completed",
+          `${escrowTransactionId}-unfreeze`,
+          "Buyer frozen funds released after approval",
+          session,
+          {
+            amount: buyerTotal, // ✅ positive value
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "escrow_release",
+              participants,
+              frozenAmount: buyerTotal,
+              releaseType: "approval",
+              direction: "debit",
+            },
+            updatedBy: requestingEmail,
+          }
+        );
 
         transaction.status = "approved";
-        transaction.claimApplied = claimResult || null;
-
         break;
       }
 
+      // ... (dispute and resolved cases remain the same)
       case "disputed": {
         const isBuyer = requestingEmail === buyer.email;
         const isSeller = requestingEmail === seller.email;
@@ -1214,46 +1059,29 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           ? "Seller"
           : "Broker";
 
-        if (isBuyer) {
-          seller.hasDispute = true;
-          await seller.save({ session });
-        } else if (isSeller) {
-          buyer.hasDispute = true;
-          await buyer.save({ session });
-        } else if (isBroker) {
-          const { flag } = req.body;
-          if (flag === "buyer" || flag === "both") {
-            buyer.hasDispute = true;
-            await buyer.save({ session });
+        // Log dispute
+        await updateWalletStatus(
+          requestingEmail,
+          "disputed",
+          `${escrowTransactionId}-dispute`,
+          `Dispute opened by ${requestingEmail}`,
+          session,
+          {
+            amount: 0,
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "escrow_dispute",
+              participants,
+              disputedBy: requestingEmail,
+            },
+            disputeDetails: {
+              caseId: escrowTransactionId,
+              reason: transaction.disputeReason,
+              openedAt: new Date(),
+            },
+            updatedBy: requestingEmail,
           }
-          if (flag === "seller" || flag === "both") {
-            seller.hasDispute = true;
-            await seller.save({ session });
-          }
-        } else if (isAdmin) {
-          const { flag } = req.body;
-          if (flag === "buyer" || flag === "all") {
-            buyer.hasDispute = true;
-            await buyer.save({ session });
-          }
-          if (flag === "seller" || flag === "all") {
-            seller.hasDispute = true;
-            await seller.save({ session });
-          }
-          if (
-            (flag === "broker" || flag === "all") &&
-            transaction.brokerEmail
-          ) {
-            const broker = await User.findOne({
-              email: transaction.brokerEmail,
-            }).session(session);
-            if (broker) {
-              broker.hasDispute = true;
-              await broker.save({ session });
-            }
-          }
-        }
-
+        );
         break;
       }
 
@@ -1266,34 +1094,27 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
           return;
         }
 
-        const { unflag } = req.body;
-
-        if (unflag === "buyer" || unflag === "all") {
-          buyer.hasDispute = false;
-          await buyer.save({ session });
-        }
-        if (unflag === "seller" || unflag === "all") {
-          seller.hasDispute = false;
-          await seller.save({ session });
-        }
-        if (
-          (unflag === "broker" || unflag === "all") &&
-          transaction.brokerEmail
-        ) {
-          const broker = await User.findOne({
-            email: transaction.brokerEmail,
-          }).session(session);
-          if (broker) {
-            broker.hasDispute = false;
-            await broker.save({ session });
-          }
-        }
-
         transaction.hasDispute = false;
         transaction.status = "resolved";
         transaction.disputeReason = undefined;
         transaction.disputedBy = undefined;
 
+        await updateWalletStatus(
+          requestingEmail,
+          "completed",
+          `${escrowTransactionId}-resolve`,
+          "Dispute resolved and audit cleared",
+          session,
+          {
+            amount: 0,
+            currency: transaction.currency,
+            transferInfo: {
+              transferType: "escrow_resolution",
+              participants,
+            },
+            updatedBy: requestingEmail,
+          }
+        );
         break;
       }
 
@@ -1303,8 +1124,9 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
         return;
     }
 
+    // Save all changes
     await Promise.all([
-      broker && broker.save({ session }),
+      broker?.save({ session }),
       seller.save({ session }),
       buyer.save({ session }),
       transaction.save({ session }),
@@ -1330,7 +1152,7 @@ export const updateEscrowTransaction = async (req: Request, res: Response) => {
 export const editEscrowTransaction = async (
   req: AuthenticatedRequest,
   res: Response
-): Promise<void> => {
+) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -1348,312 +1170,171 @@ export const editEscrowTransaction = async (
       payerRole,
       currency,
       couponCode,
-      maxCheckTime,
       claimCode,
       status,
       isPaid,
     } = req.body;
 
-    // ✅ Find the existing transaction
+    // ✅ Find existing transaction
     const existingTransaction = await EscrowTransaction.findById(transactionId);
     if (!existingTransaction) {
-      res.status(404).json({
-        message: "Escrow transaction not found.",
-      });
+      await session.abortTransaction();
+      res.status(404).json({ message: "Transaction not found." });
       return;
     }
 
-    // ✅ Check if transaction can be edited (prevent editing completed/cancelled disputes)
     if (
       ["completed", "cancelled", "disputed"].includes(
         existingTransaction.status
       )
     ) {
+      await session.abortTransaction();
       res.status(400).json({
         message: `Cannot edit transaction with status: ${existingTransaction.status}`,
       });
       return;
     }
 
-    // ✅ Validate currency if provided
-    if (currency && !["USD", "KES"].includes(currency.toUpperCase())) {
-      res.status(400).json({
-        message: "Currency must be either USD or KES",
-      });
+    // 🔹 Fetch buyer and seller
+    const [buyer, seller] = await Promise.all([
+      User.findOne({
+        email: buyerEmail || existingTransaction.buyerEmail,
+      }).session(session),
+      User.findOne({
+        email: sellerEmail || existingTransaction.sellerEmail,
+      }).session(session),
+    ]);
+
+    if (!buyer || !seller) {
+      await session.abortTransaction();
+      res.status(404).json({ message: "Buyer or Seller not found." });
       return;
     }
 
-    // ✅ Validate payerRole if provided
-    if (payerRole && !["buyer", "seller", "split"].includes(payerRole)) {
-      res.status(400).json({
-        message: "payerRole must be 'buyer', 'seller', or 'split'",
-      });
-      return;
-    }
+    // --- 1️⃣ Refund previously frozen funds ---
+    const prevTotalFrozen =
+      (existingTransaction.amountInUSD || existingTransaction.amount) +
+      (existingTransaction.feeInUSD || 0);
 
-    // ✅ Validate status if provided
-    const allowedStatuses = [
-      "new",
-      "pending",
-      "in_progress",
-      "completed",
-      "cancelled",
-      "disputed",
-    ];
-    if (status && !allowedStatuses.includes(status)) {
-      res.status(400).json({
-        message: `Status must be one of: ${allowedStatuses.join(", ")}`,
-      });
-      return;
-    }
+    buyer.walletBalance += prevTotalFrozen;
+    buyer.walletFrozeBalance = Math.max(
+      0,
+      buyer.walletFrozeBalance - prevTotalFrozen
+    );
 
-    // 🔍 Fetch users if emails are being updated
-    let buyer, seller, broker;
-    if (buyerEmail || sellerEmail || brokerEmail) {
-      const [buyerRaw, sellerRaw, brokerRaw] = await Promise.all([
-        buyerEmail
-          ? User.findOne({ email: buyerEmail })
-          : User.findOne({ email: existingTransaction.buyerEmail }),
-        sellerEmail
-          ? User.findOne({ email: sellerEmail })
-          : User.findOne({ email: existingTransaction.sellerEmail }),
-        brokerEmail
-          ? User.findOne({ email: brokerEmail })
-          : existingTransaction.brokerEmail
-          ? User.findOne({ email: existingTransaction.brokerEmail })
-          : null,
-      ]);
-
-      if (
-        (buyerEmail && !buyerRaw) ||
-        (sellerEmail && !sellerRaw) ||
-        (brokerEmail && !brokerRaw)
-      ) {
-        res.status(404).json({
-          message: `User not found: ${
-            !buyerRaw ? "buyer" : !sellerRaw ? "seller" : "broker"
-          }`,
-        });
-        return;
+    await updateWalletStatus(
+      buyer.email,
+      "refunded",
+      `${transactionId}-prev-refund`,
+      "Refund previous escrow amount & fee due to edit",
+      session,
+      {
+        amount: prevTotalFrozen,
+        currency: existingTransaction.currency,
+        transferInfo: { type: "escrow_refund_on_edit" },
+        updatedBy: req.user?.email,
       }
+    );
 
-      // Ensure wallet fields exist
-      buyer = buyerRaw ? await ensureFields(buyerRaw, session) : null;
-      seller = sellerRaw ? await ensureFields(sellerRaw, session) : null;
-      broker = brokerRaw ? await ensureFields(brokerRaw, session) : null;
-
-      // 🧠 Dispute checks for new participants
-      if (
-        (buyerEmail && buyer?.hasDispute) ||
-        (sellerEmail && seller?.hasDispute) ||
-        (brokerEmail && broker?.hasDispute)
-      ) {
-        res.status(403).json({
-          message:
-            "Transaction update denied. One or more participants have an active dispute.",
-        });
-        return;
-      }
-    }
-
-    // 🔹 Hardcoded coupons array
-    const HARDCODED_COUPONS = [
-      { code: "XWADDA", discountPercent: 50 },
-      { code: "DISCUSSION", discountPercent: 50 },
-    ];
-
-    // 🔹 Determine discount based on incoming couponCode
-    let appliedCoupon: { code: string; discountPercent: number } | null = null;
-    let discountPercent = existingTransaction.discountPercent;
-    let feeInUSD = existingTransaction.feeInUSD;
-
-    if (couponCode !== undefined) {
-      if (couponCode) {
-        const found = HARDCODED_COUPONS.find(
-          (c) => c.code.toUpperCase() === couponCode.toUpperCase()
-        );
-
-        if (!found) {
-          await session.abortTransaction();
-          res.status(400).json({ message: "Invalid or expired coupon code" });
-          return;
-        }
-
-        appliedCoupon = found;
-        discountPercent = appliedCoupon.discountPercent;
-      } else {
-        // couponCode is empty string or null - remove discount
-        discountPercent = 0;
-        appliedCoupon = null;
-      }
-    }
-
-    // 💰 Recalculate amounts if amount, fee, currency, or coupon changed
-    const numericAmount =
+    // --- 2️⃣ Recalculate amounts for updated transaction ---
+    const newAmount =
       amount !== undefined ? Number(amount) : existingTransaction.amount;
-    const numericFee =
-      fee !== undefined ? Number(fee) : existingTransaction.fee;
-    const currentCurrency = currency || existingTransaction.currency;
+    const newFee = fee !== undefined ? Number(fee) : existingTransaction.fee;
+    const newCurrency = currency || existingTransaction.currency;
 
-    // Convert amounts to USD for wallet operations
-    const amountInUSD = convertToUSD(numericAmount, currentCurrency);
+    const amountInUSD = convertToUSD(newAmount, newCurrency);
+    const feeInUSD = convertToUSD(newFee || 0, newCurrency);
 
-    if (
-      fee !== undefined ||
-      couponCode !== undefined ||
-      currency !== undefined
-    ) {
-      const baseFeeInUSD = convertToUSD(numericFee, currentCurrency);
-      feeInUSD =
-        discountPercent || 0 > 0
-          ? baseFeeInUSD * ((100 - (discountPercent || 0)) / 100)
-          : baseFeeInUSD;
+    let discountedFeeInUSD = feeInUSD;
+    let discountPercent = existingTransaction.discountPercent;
+
+    if (couponCode) {
+      const { discountedFeeInUSD: discounted, discountApplied } =
+        await applyCouponDiscount(feeInUSD, couponCode);
+      discountedFeeInUSD = discounted;
+      discountPercent = discountApplied || 0;
     }
 
-    // 💰 Handle financial updates and wallet adjustments
-    if (
-      amount !== undefined ||
-      fee !== undefined ||
-      currency !== undefined ||
-      buyerEmail !== undefined ||
-      sellerEmail !== undefined ||
-      payerRole !== undefined
-    ) {
-      await handleFinancialUpdates(
-        existingTransaction,
-        {
-          buyerEmail: buyerEmail || existingTransaction.buyerEmail,
-          sellerEmail: sellerEmail || existingTransaction.sellerEmail,
-          amount: numericAmount,
-          fee: numericFee,
-          amountInUSD,
-          feeInUSD,
-          payerRole: payerRole || existingTransaction.payerRole,
-          currency: currentCurrency,
-        },
-        session
-      );
+    // --- 3️⃣ Deduct and freeze funds afresh ---
+    const totalToFreeze = amountInUSD + discountedFeeInUSD;
+
+    if (buyer.walletBalance < totalToFreeze) {
+      await session.abortTransaction();
+      res.status(400).json({ message: "Insufficient wallet balance." });
+      return;
     }
 
-    // 🧾 Build update object
-    const updateData: any = {
-      ...(buyerEmail !== undefined && { buyerEmail }),
-      ...(sellerEmail !== undefined && { sellerEmail }),
-      ...(brokerEmail !== undefined && { brokerEmail }),
-      ...(brokerAmount !== undefined && { brokerAmount: Number(brokerAmount) }),
-      ...(item !== undefined && { item }),
-      ...(description !== undefined && { description }),
-      ...(amount !== undefined && { amount: numericAmount }),
-      ...(fee !== undefined && { fee: numericFee }),
-      ...(payerRole !== undefined && { payerRole }),
-      ...(currency !== undefined && { currency }),
-      ...(maxCheckTime !== undefined && { maxCheckTime }),
-      ...(couponCode !== undefined && { couponCode }),
-      ...(claimCode !== undefined && { claimCode }),
-      ...(status !== undefined && { status }),
-      ...(isPaid !== undefined && { isPaid }),
+    buyer.walletBalance -= totalToFreeze;
+    buyer.walletFrozeBalance += totalToFreeze;
+
+    await updateWalletStatus(
+      buyer.email,
+      "frozen",
+      `${transactionId}-updated-freeze`,
+      "Freeze updated escrow amount & fee after edit",
+      session,
+      {
+        amount: totalToFreeze,
+        currency: newCurrency,
+        fee: discountedFeeInUSD,
+        transferInfo: { type: "escrow_freeze_on_edit" },
+        claimInfo: claimCode ? { code: claimCode } : null,
+        updatedBy: req.user?.email,
+      }
+    );
+
+    // --- 4️⃣ Update transaction ---
+    const updatedData: any = {
+      buyerEmail: buyerEmail || existingTransaction.buyerEmail,
+      sellerEmail: sellerEmail || existingTransaction.sellerEmail,
+      brokerEmail: brokerEmail || existingTransaction.brokerEmail,
+      brokerAmount:
+        brokerAmount !== undefined
+          ? Number(brokerAmount)
+          : existingTransaction.brokerAmount,
+      item: item ?? existingTransaction.item,
+      description: description ?? existingTransaction.description,
+      amount: newAmount,
+      fee: newFee !== undefined ? newFee : existingTransaction.fee,
+      amountInUSD,
+      feeInUSD,
+      buyerFeeInUSD: discountedFeeInUSD,
+      payerRole: payerRole || existingTransaction.payerRole,
+      currency: newCurrency,
+      couponCode: couponCode ?? existingTransaction.couponCode,
+      claimCode: claimCode ?? existingTransaction.claimCode,
+      discountPercent,
+      status: status ?? existingTransaction.status,
+      isPaid: isPaid ?? existingTransaction.isPaid,
+      updatedAt: new Date(),
     };
 
-    // Update calculated fields if they changed
-    if (amount !== undefined || currency !== undefined) {
-      updateData.amountInUSD = amountInUSD;
-      updateData.exchangeRate =
-        currentCurrency.toUpperCase() === "KES" ? exchangeRate : null;
-    }
-
-    if (
-      fee !== undefined ||
-      couponCode !== undefined ||
-      currency !== undefined
-    ) {
-      updateData.feeInUSD = feeInUSD;
-      updateData.discountPercent = discountPercent;
-    }
-
-    // Update timestamps
-    updateData.updatedAt = new Date();
-
-    // ✅ Update the transaction
     const updatedTransaction = await EscrowTransaction.findByIdAndUpdate(
       transactionId,
-      updateData,
+      updatedData,
       { new: true, session, runValidators: true }
     );
 
-    if (!updatedTransaction) {
-      await session.abortTransaction();
-      res.status(404).json({
-        message: "Failed to update escrow transaction",
-      });
-      return;
-    }
-
+    await buyer.save({ session });
     await session.commitTransaction();
     session.endSession();
 
     res.status(200).json({
       success: true,
-      message: "Escrow transaction updated successfully",
+      message:
+        "Escrow transaction updated successfully with refreshed wallet balances.",
       transaction: updatedTransaction,
     });
+    return;
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
-    handleServerError(res, error, "Error updating escrow transaction");
-  }
-};
-
-// Helper function to handle financial updates and wallet adjustments
-const handleFinancialUpdates = async (
-  existingTransaction: any,
-  newData: {
-    buyerEmail: string;
-    sellerEmail: string;
-    amount: number;
-    fee: number;
-    amountInUSD: number;
-    feeInUSD: number;
-    payerRole: string;
-    currency: string;
-  },
-  session: mongoose.ClientSession
-) => {
-  const {
-    buyerEmail,
-    sellerEmail,
-    amount,
-    fee,
-    amountInUSD,
-    feeInUSD,
-    payerRole,
-    currency,
-  } = newData;
-
-  // If financial details changed, we need to adjust wallet balances
-  const amountChanged = amount !== existingTransaction.amount;
-  const feeChanged = fee !== existingTransaction.fee;
-  const currencyChanged = currency !== existingTransaction.currency;
-  const payerRoleChanged = payerRole !== existingTransaction.payerRole;
-  const participantsChanged =
-    buyerEmail !== existingTransaction.buyerEmail ||
-    sellerEmail !== existingTransaction.sellerEmail;
-
-  if (
-    amountChanged ||
-    feeChanged ||
-    currencyChanged ||
-    payerRoleChanged ||
-    participantsChanged
-  ) {
-    // 1. First, refund any existing frozen amounts to original participants
-    if (existingTransaction.isPaid) {
-      await refundFrozenAmounts(existingTransaction, session);
-    }
-
-    // 2. Then, calculate and deduct new amounts if isPaid was true
-    if (existingTransaction.isPaid) {
-      await deductNewAmounts(existingTransaction, newData, session);
-    }
+    console.error("❌ Error editing escrow transaction:", error);
+    res.status(500).json({
+      message: "Failed to edit escrow transaction",
+      error: error,
+    });
+    return;
   }
 };
 
@@ -1811,7 +1492,7 @@ export const deleteEscrowTransaction = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    // 🔍 Find transaction first
+    // 🔍 Find the transaction first
     const transaction = await EscrowTransaction.findById(id);
     if (!transaction) {
       res.status(404).json({ message: "Transaction not found." });
@@ -1826,6 +1507,22 @@ export const deleteEscrowTransaction = async (req: Request, res: Response) => {
       return;
     }
 
+    // 🚫 Prevent deletion if the transaction is already paid/completed
+    const paidStatuses = ["completed", "approved", "cancelled", "disputed"];
+    if (paidStatuses.includes(transaction.status)) {
+      res.status(400).json({
+        message: `Cannot delete a ${transaction.status} transaction — it has already been paid or finalized.`,
+      });
+      return;
+    }
+
+    if (transaction.isPaid) {
+      res.status(403).json({
+        message: " Transaction is already paid",
+      });
+      return;
+    }
+
     // 🗑️ Proceed to delete
     await EscrowTransaction.findByIdAndDelete(id);
 
@@ -1833,7 +1530,6 @@ export const deleteEscrowTransaction = async (req: Request, res: Response) => {
       success: true,
       message: "Escrow transaction deleted successfully.",
     });
-    return;
   } catch (error) {
     handleServerError(res, error, "Error deleting escrow transaction");
   }
